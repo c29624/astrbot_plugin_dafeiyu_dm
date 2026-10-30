@@ -28,7 +28,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.1.1"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -323,8 +323,12 @@ class DafeiyuDmPlugin(Star):
                     m["at"] = now + 10 * 60  # 半梦半醒不是正式醒来，缓一缓
                     self._save_state()
                 elif phase == "awake":
-                    await self._fire("morning", self.tpl_morning)
-                    m["sent"] = True
+                    m["tries"] = int(m.get("tries", 0)) + 1
+                    if await self._fire("morning", self.tpl_morning):
+                        m["sent"] = True
+                    elif m["tries"] >= 3:
+                        m["sent"] = True  # 连续失败3次，销账防死循环
+                        logger.warning("[主动私聊] 晨起问候重试3次未发出，放弃")
                     self._save_state()
 
         # 睡前：今晚入睡点前 NIGHT_WINDOW_MIN 分钟内、且她还清醒
@@ -343,8 +347,12 @@ class DafeiyuDmPlugin(Star):
                     and phase == "awake"
                     and 0 < bed_ts - now <= NIGHT_WINDOW_MIN * 60
                 ):
-                    await self._fire("night", self.tpl_night)
-                    n["sent"] = True
+                    n["tries"] = int(n.get("tries", 0)) + 1
+                    if await self._fire("night", self.tpl_night):
+                        n["sent"] = True
+                    elif n["tries"] >= 3:
+                        n["sent"] = True  # 连续失败3次，销账防死循环
+                        logger.warning("[主动私聊] 睡前晚安重试3次未发出，放弃")
                     self._save_state()
 
         # 随机想念：到点即发；睡着则顺延半小时（窗口外作废）
@@ -354,8 +362,8 @@ class DafeiyuDmPlugin(Star):
             rest = [t for t in plans if t > now]
             for ts in due:
                 if phase == "awake" and self._quota_ok(now):
-                    await self._fire("random", self.tpl_random)
-                    self._st["random_sent"] = int(self._st.get("random_sent", 0)) + 1
+                    if await self._fire("random", self.tpl_random):
+                        self._st["random_sent"] = int(self._st.get("random_sent", 0)) + 1
                 elif phase == "sleeping" or phase == "temp_wake":
                     late = now + 30 * 60
                     end_dt = datetime.now().replace(
@@ -375,16 +383,17 @@ class DafeiyuDmPlugin(Star):
 
     # ---------- 发送 ----------
 
-    async def _fire(self, kind: str, template: str):
+    async def _fire(self, kind: str, template: str) -> bool:
+        """返回是否真的发出去了——调用方据此记账，没发出不销账、窗口内自动重试"""
         tmap = self._target_map()
         if not tmap:
-            logger.info(f"[主动私聊] {kind}：无可用目标/平台，跳过")
-            return
+            logger.info(f"[主动私聊] {kind}：无可用目标/平台，跳过（不销账）")
+            return False
         now = time.time()
         if not self._quota_ok(now) and kind != "morning" and kind != "night":
-            return  # 随机类受频控；晨起/睡前是作息事件，走自己的开关不受间隔限制（仍计总量）
+            return False  # 随机类受频控；晨起/睡前是作息事件，不受间隔限制（仍计总量）
         if int(self._st.get("sent_total", 0)) >= self.c_cap:
-            return
+            return False
         sent_any = False
         for pid, targets in tmap.items():
             for qq in targets:
@@ -400,6 +409,9 @@ class DafeiyuDmPlugin(Star):
             self._st["sent_total"] = int(self._st.get("sent_total", 0)) + 1
             self._st["last_dm_ts"] = now
             self._save_state()
+        else:
+            logger.warning(f"[主动私聊] {kind}：全部目标发送失败")
+        return sent_any
 
     def _record_text(self, content) -> str:
         """history 记录的 content 可能是 str 或分段 list，取纯文本"""
