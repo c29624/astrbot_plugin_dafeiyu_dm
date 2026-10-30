@@ -28,7 +28,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.0.3"
+PLUGIN_VERSION = "1.1.0"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -40,6 +40,8 @@ DEFAULTS = {
     "dm_targets": [],          # 留空 = 自动用 AstrBot 管理员列表
     "dm_platform": "",         # 留空 = 自动发现第一个平台
     "dm_owner_alias": "对方",   # 模板变量 {who}：对方怎么称呼收信人（大肥鱼填"主人"）
+    "dm_with_context": True,    # 生成时附带该会话最近聊天记录（接话茬）
+    "dm_context_count": 10,
     "dm_respect_sleep": True,
     "dm_morning_on": True,
     "dm_night_on": True,
@@ -97,6 +99,8 @@ class DafeiyuDmPlugin(Star):
         self.c_targets = [str(t).strip() for t in (g("dm_targets") or []) if str(t).strip()]
         self.c_platform = str(g("dm_platform") or "").strip()
         self.c_alias = str(g("dm_owner_alias") or DEFAULTS["dm_owner_alias"])
+        self.c_with_ctx = bool(g("dm_with_context"))
+        self.c_ctx_n = max(3, min(40, int(g("dm_context_count") or 10)))
         self.c_respect_sleep = bool(g("dm_respect_sleep"))
         self.c_morning = bool(g("dm_morning_on"))
         self.c_night = bool(g("dm_night_on"))
@@ -381,11 +385,11 @@ class DafeiyuDmPlugin(Star):
             return  # 随机类受频控；晨起/睡前是作息事件，走自己的开关不受间隔限制（仍计总量）
         if int(self._st.get("sent_total", 0)) >= self.c_cap:
             return
-        text = await self._gen(template)
         sent_any = False
         for pid, targets in tmap.items():
             for qq in targets:
                 umo = f"{pid}:FriendMessage:{qq}"
+                text = await self._gen(template, umo)  # 按目标逐个生成（上下文各不同）
                 try:
                     await self.context.send_message(umo, MessageChain().message(text))
                     sent_any = True
@@ -397,8 +401,55 @@ class DafeiyuDmPlugin(Star):
             self._st["last_dm_ts"] = now
             self._save_state()
 
-    async def _gen(self, template: str) -> str:
-        """首选 LLM 临场生成（带现用人设）；失败/超时回落语料池"""
+    def _record_text(self, content) -> str:
+        """history 记录的 content 可能是 str 或分段 list，取纯文本"""
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = []
+            for p in content:
+                if isinstance(p, dict) and isinstance(p.get("text"), str):
+                    parts.append(p["text"])
+                elif isinstance(getattr(p, "text", None), str):
+                    parts.append(p.text)
+            return "".join(parts).strip()
+        return ""
+
+    async def _recent_history(self, umo: str) -> str:
+        """你们这个会话最近的聊天记录（末尾 N 条），给主动消息接话茬用"""
+        if not self.c_with_ctx:
+            return ""
+        try:
+            cm = self.context.conversation_manager
+            cid = await cm.get_curr_conversation_id(umo)
+            if not cid:
+                return ""
+            conv = await cm.get_conversation(umo, cid)
+            history = getattr(conv, "history", None)
+            if not history:
+                return ""
+            if isinstance(history, str):
+                history = json.loads(history)
+            if not isinstance(history, list):
+                return ""
+            lines = []
+            for rec in history:
+                if not isinstance(rec, dict):
+                    continue
+                t = self._record_text(rec.get("content", ""))
+                if not t:
+                    continue
+                who = "你" if rec.get("role") == "assistant" else "对方"
+                lines.append(f"{who}: {t[:80]}")
+            if not lines:
+                return ""
+            lines = lines[-self.c_ctx_n:]
+            return "[你们最近的聊天记录（末尾几条，供接话茬）]\n" + "\n".join(lines) + "\n\n"
+        except Exception:
+            return ""
+
+    async def _gen(self, template: str, umo: str = "") -> str:
+        """首选 LLM 临场生成（现用人设 + 最近聊天上下文 + 当前时间）；失败/超时回落语料池"""
         prompt_tpl = template.replace("{who}", self.c_alias)
         try:
             try:
@@ -419,7 +470,14 @@ class DafeiyuDmPlugin(Star):
                         )
                 except Exception:
                     persona_text = ""
-                prompt = (persona_text[:1500] + "\n\n" if persona_text else "") + prompt_tpl
+                ctx = await self._recent_history(umo) if umo else ""
+                now_line = f"[当前时间 {datetime.now().strftime('%H:%M')}]\n\n"
+                prompt = (
+                    (persona_text[:1500] + "\n\n" if persona_text else "")
+                    + ctx
+                    + now_line
+                    + prompt_tpl
+                )
                 resp = await asyncio.wait_for(
                     provider.text_chat(prompt=prompt, session_id=f"{PLUGIN_NAME}_gen"),
                     timeout=25,
@@ -471,10 +529,11 @@ class DafeiyuDmPlugin(Star):
         if not self._is_admin(event):
             yield event.plain_result("没权限")
             return
-        text = await self._gen(self.tpl_random)
+        umo = str(event.unified_msg_origin)
+        pid = umo.split(":")[0]  # 发送者所在平台
+        sid = str(event.get_sender_id())
+        text = await self._gen(self.tpl_random, umo=f"{pid}:FriendMessage:{sid}")
         try:
-            sid = str(event.get_sender_id())
-            pid = str(event.unified_msg_origin).split(":")[0]  # 发送者所在平台
             await self.context.send_message(
                 f"{pid}:FriendMessage:{sid}", MessageChain().message(text)
             )

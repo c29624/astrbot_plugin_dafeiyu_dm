@@ -27,6 +27,23 @@
         "type": "string",
         "default": "对方"
       },
+      "dm_with_context": {
+        "description": "附带聊天上下文",
+        "hint": "开=生成主动消息时附带该会话最近几条聊天记录（能接话茬，如\"刚说到那个\"）；关=只有人设盲发",
+        "type": "bool",
+        "default": true
+      },
+      "dm_context_count": {
+        "description": "上下文条数",
+        "hint": "附带给模型的最近聊天记录条数（3~40）",
+        "type": "int",
+        "default": 10,
+        "slider": {
+          "min": 3,
+          "max": 40,
+          "step": 1
+        }
+      },
       "dm_respect_sleep": {
         "description": "作息联动（睡觉插件）",
         "hint": "开=读 astrbot_plugin_dafeiyu_sleep 的状态：她睡着绝不主动发消息，晨起/睡前钩子也按作息走。没装睡觉插件自动当白天跑",
