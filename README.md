@@ -30,19 +30,30 @@
 
 | 组 | 字段 | 默认 | 说明 |
 |---|---|---|---|
-| 基础 | dm_targets | `[]` | 发送对象 QQ；留空=各平台绑定配置的管理员（多配置文件按平台解析） |
-| 基础 | dm_owner_alias | `对方` | 提示词里怎么称呼收信人（人设叫"主人"就填主人） |
-| 基础 | dm_respect_sleep | `true` | 作息联动开关 |
-| dm_with_context | `true` | 附带最近聊天记录（接话茬） |
-| dm_context_count | `10` | 附带条数 |
+| 基础 | dm_enabled | `true` | 插件总开关 |
+| 基础 | dm_targets | `[]` | 发送对象 QQ；留空=**全部配置文件管理员的并集**（多配置文件/多管理员场景都覆盖），填了就只发这些人 |
+| 基础 | dm_platform | `""` | 平台 ID；留空=自动发现（多平台时各自发它自己的管理员） |
+| 基础 | dm_owner_alias | `对方` | 全局称呼（提示词变量 {who}） |
+| 基础 | dm_alias_map | `[]` | 按 QQ 配称呼：`"10001=主人"`——多收信人各叫各的 |
+| 基础 | dm_with_context | `true` | 生成时附带该会话最近聊天记录（接话茬） |
+| 基础 | dm_context_count | `10` | 附带条数（3~40） |
+| 基础 | dm_respect_sleep | `true` | 作息联动（读睡觉插件状态：睡着不发；没装则当白天跑） |
 | 触发 | dm_morning_on / dm_night_on | `true` | 晨起/睡前开关 |
 | 触发 | dm_random_count | `2` | 随机想念次数/天，0=关 |
-| 触发 | dm_window_start / end | `10:00`~`22:00` | 随机想念时间窗（HH:MM） |
-| 触发 | dm_min_gap_hours | `2.0` | 随机消息最短间隔 |
-| 触发 | dm_daily_cap | `4` | 每日总量上限（建议 ≤4） |
-| dm_seg_enabled | `true` | 拟人分段发送（打字时间间隔） |
-| 模板 | dm_morning/night/random_template | 见 hint | 提示词，变量 `{who}` |
+| 触发 | dm_window_start / dm_window_end | `10:00`~`22:00` | 随机想念时间窗（HH:MM） |
+| 触发 | dm_min_gap_hours | `2.0` | 随机消息与上一条的最短间隔 |
+| 触发 | dm_daily_cap | `4` | 每日总量上限（建议 ≤4，防风控） |
+| 触发 | dm_seg_enabled | `true` | 拟人分段发送（按句切分，条间隔=打字时间） |
+| 模板 | dm_morning_template | 见 hint | 晨起提示词（{who}） |
+| 模板 | dm_night_template | 见 hint | 睡前提示词（晚安只是选项，语气随聊天氛围） |
+| 模板 | dm_night2_template | 见 hint | 已道过晚安时的收尾话提示词 |
+| 模板 | dm_random_template | 见 hint | 随机想念提示词 |
+| 模板 | dm_makeup_night_template | 见 hint | 补发晚安提示词 |
 | 模板 | dm_fallback_pool | 5 句 | LLM 失败回落语料 |
+
+提示词统一原则：只给任务与状态（刚醒/要睡/突然想起），措辞和语气让模型按聊天上下文自己定——不锁腔调。
+
+另有**补发通道**（非面板配置）：往插件数据目录写 `makeup.json`（`{"kind": "night"|"morning"|"random"}`），30 秒内补发一条。
 
 ## 安装
 
