@@ -29,7 +29,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.2.2"
+PLUGIN_VERSION = "1.2.3"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -77,9 +77,10 @@ DEFAULTS = {
         "就一句话，困困的、带着点迷糊，别提任何系统或作息数字。"
     ),
     "dm_night2_template": (
-        "你们刚才已经道过晚安了。你现在真的躺下要睡了——跟{who}说一句收尾的话"
-        "（类似\"我也去睡啦\"\"真去睡了，明天见\"这种），别再说一遍晚安，"
-        "就一句，带着困意，别提任何系统或作息数字。"
+        "你们刚才已经道过晚安（或道别）了。你现在真的躺下要睡了——"
+        "按你们刚才聊天的氛围，跟{who}发一句自然的收尾：语气跟着氛围走，"
+        "平常聊就平常收，腻歪着收尾就接着那个劲儿，别端着客套。"
+        "别再说一遍晚安，就一句，带着困意，别提任何系统或作息数字。"
     ),
 }
 
