@@ -28,7 +28,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.1.2"
+PLUGIN_VERSION = "1.1.3"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -40,6 +40,7 @@ DEFAULTS = {
     "dm_targets": [],          # 留空 = 自动用 AstrBot 管理员列表
     "dm_platform": "",         # 留空 = 自动发现第一个平台
     "dm_owner_alias": "对方",   # 模板变量 {who}：对方怎么称呼收信人（大肥鱼填"主人"）
+    "dm_alias_map": [],           # 按 QQ 配称呼：["10001=主人"]，没配的用全局
     "dm_with_context": True,    # 生成时附带该会话最近聊天记录（接话茬）
     "dm_context_count": 10,
     "dm_respect_sleep": True,
@@ -103,6 +104,16 @@ class DafeiyuDmPlugin(Star):
         self.c_targets = [str(t).strip() for t in (g("dm_targets") or []) if str(t).strip()]
         self.c_platform = str(g("dm_platform") or "").strip()
         self.c_alias = str(g("dm_owner_alias") or DEFAULTS["dm_owner_alias"])
+        # 按 QQ 配称呼：["10001=主人", ...]，没配的用全局称呼
+        self.c_alias_map = {}
+        for item in g("dm_alias_map") or []:
+            try:
+                qq, alias = str(item).split("=", 1)
+                qq, alias = qq.strip(), alias.strip()
+                if qq and alias:
+                    self.c_alias_map[qq] = alias
+            except Exception:
+                continue
         self.c_with_ctx = bool(g("dm_with_context"))
         self.c_ctx_n = max(3, min(40, int(g("dm_context_count") or 10)))
         self.c_respect_sleep = bool(g("dm_respect_sleep"))
@@ -267,8 +278,9 @@ class DafeiyuDmPlugin(Star):
 
     def _target_map(self) -> dict:
         """{platform_id: [qq...]}。显式填了 dm_targets → 目标放首个平台（沿用旧行为）；
-        留空 → 按平台各自解析：多配置文件场景下，每个平台用它绑定配置文件的 admins_id
-        （平台没绑/绑定只到具体会话 → 回落默认配置的管理员）。"""
+        留空 → ①按平台各自解析绑定配置的管理员 ②再并集所有配置文件的 admins_id——
+        多配置文件常绑定到具体会话（平台级探测拿不到），同一 bot 服务的所有配置的
+        管理员都视作它的主人，并集兜底挂在第一个平台下发。"""
         if self.c_targets:
             pids = self._platform_ids()
             return {pids[0]: list(self.c_targets)} if pids else {}
@@ -285,6 +297,25 @@ class DafeiyuDmPlugin(Star):
             qs = list(dict.fromkeys(str(a).strip() for a in admins if str(a).strip()))
             if qs:
                 result[pid] = qs  # 平台内去重；跨平台同名QQ不去重（各bot发各的管理员）
+        # 并集补充：全部配置文件的管理员（绑定到具体会话的配置在这里才被看到）
+        pids = self._platform_ids()
+        first = pids[0] if pids else None
+        if first is not None:
+            try:
+                confs = getattr(self.context.astrbot_config_mgr, "confs", {}) or {}
+            except Exception:
+                confs = {}
+            for conf in (confs.values() if hasattr(confs, "values") else []):
+                try:
+                    for a in conf.get("admins_id", []) or []:
+                        a = str(a).strip()
+                        if not a or any(a in qs for qs in result.values()):
+                            continue
+                        result.setdefault(first, [])
+                        if a not in result[first]:
+                            result[first].append(a)
+                except Exception:
+                    continue
         return result
 
     def _targets(self):
@@ -491,7 +522,13 @@ class DafeiyuDmPlugin(Star):
 
     async def _gen(self, template: str, umo: str = "") -> str:
         """首选 LLM 临场生成（现用人设 + 最近聊天上下文 + 当前时间）；失败/超时回落语料池"""
-        prompt_tpl = template.replace("{who}", self.c_alias)
+        who = self.c_alias
+        try:
+            qq = umo.split(":")[2] if umo else ""
+            who = self.c_alias_map.get(qq, self.c_alias)
+        except Exception:
+            pass
+        prompt_tpl = template.replace("{who}", who)
         try:
             try:
                 provider = await self.context.get_using_provider_async(None)

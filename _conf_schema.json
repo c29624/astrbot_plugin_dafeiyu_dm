@@ -27,6 +27,12 @@
         "type": "string",
         "default": "对方"
       },
+      "dm_alias_map": {
+        "description": "按 QQ 配称呼（列表）",
+        "hint": "每项一条 \"QQ=称呼\"（如 10001=主人）。多收信人时各叫各的：没配到的用上面的全局称呼",
+        "type": "list",
+        "default": []
+      },
       "dm_with_context": {
         "description": "附带聊天上下文",
         "hint": "开=生成主动消息时附带该会话最近几条聊天记录（能接话茬，如\"刚说到那个\"）；关=只有人设盲发",
