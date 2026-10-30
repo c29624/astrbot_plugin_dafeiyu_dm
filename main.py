@@ -29,7 +29,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.2.1"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -481,6 +481,11 @@ class DafeiyuDmPlugin(Star):
         for pid, targets in tmap.items():
             for qq in targets:
                 umo = f"{pid}:FriendMessage:{qq}"
+                if kind == "night" and await self._already_said_goodnight(umo):
+                    # 聊天里已道过晚安：这个目标跳过（算"已了结"，不重试不报警）
+                    logger.info(f"[主动私聊] {kind} -> {qq}: 聊天里已道过晚安，跳过")
+                    sent_any = True
+                    continue
                 text = await self._gen(template, umo)  # 按目标逐个生成（上下文各不同）
                 try:
                     await self._send_human(umo, text)
@@ -509,6 +514,29 @@ class DafeiyuDmPlugin(Star):
                     parts.append(p.text)
             return "".join(parts).strip()
         return ""
+
+    async def _already_said_goodnight(self, umo: str) -> bool:
+        """她最近是否已在聊天里说过晚安（最近12条记录内，assistant侧含'晚安'）
+        ——睡前主动消息防重复：道过就不再主动补一句"""
+        try:
+            cm = self.context.conversation_manager
+            cid = await cm.get_curr_conversation_id(umo)
+            if not cid:
+                return False
+            conv = await cm.get_conversation(umo, cid)
+            history = getattr(conv, "history", None)
+            if isinstance(history, str):
+                history = json.loads(history)
+            if not isinstance(history, list):
+                return False
+            for rec in reversed(history[-12:]):
+                if isinstance(rec, dict) and rec.get("role") == "assistant":
+                    if "晚安" in self._record_text(rec.get("content", "")):
+                        return True
+                    break  # 只看最后一条她的话：道别后若又聊开了，晚安场景已翻篇
+            return False
+        except Exception:
+            return False
 
     async def _recent_history(self, umo: str) -> str:
         """你们这个会话最近的聊天记录（末尾 N 条），给主动消息接话茬用"""
