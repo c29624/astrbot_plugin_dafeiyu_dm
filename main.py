@@ -28,7 +28,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.1.1"
+PLUGIN_VERSION = "1.1.2"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -69,6 +69,10 @@ DEFAULTS = {
         "冒个泡，证明我还活着",
         "没啥事，就是来看看你回没回消息",
     ],
+    "dm_makeup_night_template": (
+        "你刚躺下准备睡了，临睡前才想起来还没跟{who}说晚安，现在补上。"
+        "就一句话，困困的、带着点迷糊，别提任何系统或作息数字。"
+    ),
 }
 
 
@@ -112,6 +116,9 @@ class DafeiyuDmPlugin(Star):
         self.tpl_morning = str(g("dm_morning_template"))
         self.tpl_night = str(g("dm_night_template"))
         self.tpl_random = str(g("dm_random_template"))
+        self.tpl_makeup_night = str(
+            g("dm_makeup_night_template")
+        )
         pool = [str(s).strip() for s in (g("dm_fallback_pool") or []) if str(s).strip()]
         self.c_pool = pool or list(DEFAULTS["dm_fallback_pool"])
         # 当日执行状态（dm_state.json 持久化，跨重启不重发不丢计划）
@@ -303,6 +310,16 @@ class DafeiyuDmPlugin(Star):
     async def _on_tick(self):
         if not self.enabled:
             return
+        # 补发通道：data 目录出现 makeup.json（{"kind": "night"|"morning"|"random"}）即消费
+        # ——绕过作息相位（管理员显式补发），仍走频控与总量；发完即删指令文件
+        mk = self._consume_makeup()
+        if mk:
+            tpl = {
+                "night": self.tpl_makeup_night,
+                "morning": self.tpl_morning,
+                "random": self.tpl_random,
+            }.get(mk, self.tpl_random)
+            await self._fire("makeup", tpl)
         self._rollover_day()
         now = time.time()
         phase = self._sleep_phase()
@@ -381,6 +398,18 @@ class DafeiyuDmPlugin(Star):
             return False
         return True
 
+    def _consume_makeup(self):
+        """补发指令文件：外部/管理往 data/makeup.json 写 {"kind":"night"} 即触发，读后即删"""
+        try:
+            p = self._data_dir / "makeup.json"
+            if p.exists():
+                v = json.loads(p.read_text(encoding="utf-8")).get("kind")
+                p.unlink(missing_ok=True)
+                return str(v) if v else None
+        except Exception:
+            logger.warning("[主动私聊] 补发指令文件读取失败", exc_info=True)
+        return None
+
     # ---------- 发送 ----------
 
     async def _fire(self, kind: str, template: str) -> bool:
@@ -390,7 +419,7 @@ class DafeiyuDmPlugin(Star):
             logger.info(f"[主动私聊] {kind}：无可用目标/平台，跳过（不销账）")
             return False
         now = time.time()
-        if not self._quota_ok(now) and kind != "morning" and kind != "night":
+        if not self._quota_ok(now) and kind not in ("morning", "night", "makeup"):
             return False  # 随机类受频控；晨起/睡前是作息事件，不受间隔限制（仍计总量）
         if int(self._st.get("sent_total", 0)) >= self.c_cap:
             return False
