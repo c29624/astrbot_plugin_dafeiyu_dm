@@ -1,0 +1,135 @@
+{
+  "basic": {
+    "type": "object",
+    "title": "基础",
+    "description": "主动私聊：晨起/睡前/随机想念三类触发，各自带开关",
+    "items": {
+      "dm_enabled": {
+        "description": "启用插件",
+        "type": "bool",
+        "default": true
+      },
+      "dm_targets": {
+        "description": "发送对象 QQ 列表",
+        "hint": "留空 = 自动使用 AstrBot 管理员列表（配置里的 admins_id），装完不用填就能用；填了就只发给这些人",
+        "type": "list",
+        "default": []
+      },
+      "dm_platform": {
+        "description": "平台 ID",
+        "hint": "留空 = 自动发现第一个平台。消息格式 平台ID:FriendMessage:QQ",
+        "type": "string",
+        "default": ""
+      },
+      "dm_owner_alias": {
+        "description": "收信人称呼",
+        "hint": "模板变量 {who} 的值：提示词里怎么称呼收信人。人设里叫\"主人\"的填\"主人\"更自然",
+        "type": "string",
+        "default": "对方"
+      },
+      "dm_respect_sleep": {
+        "description": "作息联动（睡觉插件）",
+        "hint": "开=读 astrbot_plugin_dafeiyu_sleep 的状态：她睡着绝不主动发消息，晨起/睡前钩子也按作息走。没装睡觉插件自动当白天跑",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "trigger": {
+    "type": "object",
+    "title": "触发",
+    "items": {
+      "dm_morning_on": {
+        "description": "晨起问候",
+        "hint": "醒来后5~30分钟来一句，带刚醒劲儿",
+        "type": "bool",
+        "default": true
+      },
+      "dm_night_on": {
+        "description": "睡前晚安",
+        "hint": "今晚入睡点前10分钟内来说句晚安再睡",
+        "type": "bool",
+        "default": true
+      },
+      "dm_random_count": {
+        "description": "随机想念次数/天",
+        "hint": "白天清醒期随机时刻\"突然想起你\"，0=关。每天凌晨在时间窗内随机抽时刻，到点她睡着则顺延半小时、出窗作废",
+        "type": "int",
+        "default": 2,
+        "slider": {
+          "min": 0,
+          "max": 5,
+          "step": 1
+        }
+      },
+      "dm_window_start": {
+        "description": "随机窗·开始",
+        "hint": "格式 HH:MM。随机想念只在这个时间窗内触发",
+        "type": "string",
+        "default": "10:00"
+      },
+      "dm_window_end": {
+        "description": "随机窗·结束",
+        "hint": "格式 HH:MM",
+        "type": "string",
+        "default": "22:00"
+      },
+      "dm_min_gap_hours": {
+        "description": "两次最短间隔（小时）",
+        "hint": "随机想念与上一条主动消息的间隔下限，防刷屏防风控。晨起/睡前不受此限（作息事件）",
+        "type": "float",
+        "default": 2.0,
+        "slider": {
+          "min": 0,
+          "max": 12,
+          "step": 0.5
+        }
+      },
+      "dm_daily_cap": {
+        "description": "每日总量上限",
+        "hint": "晨起+睡前+随机合计不超过这么多条。建议≤4，私聊主动消息频率过高有风控风险",
+        "type": "int",
+        "default": 4,
+        "slider": {
+          "min": 1,
+          "max": 10,
+          "step": 1
+        }
+      }
+    }
+  },
+  "template": {
+    "type": "object",
+    "title": "提示词模板",
+    "items": {
+      "dm_morning_template": {
+        "description": "晨起提示词",
+        "hint": "变量 {who}=收信人称呼。LLM现场生成，失败回落语料池",
+        "type": "text",
+        "default": "你刚睡醒没多久，突然想跟{who}说句话。就一两句，带着刚醒的劲儿，自然一点，别提任何系统或作息数字。"
+      },
+      "dm_night_template": {
+        "description": "睡前提示词",
+        "type": "text",
+        "default": "你马上要去睡了，睡前想跟{who}说句晚安。就一句话，困困的，别提任何系统或作息数字。"
+      },
+      "dm_random_template": {
+        "description": "随机想念提示词",
+        "type": "text",
+        "default": "你白天突然想起了{who}，想主动跟{who}说句话。一两句，像真人突然想起对方随手发条消息那样自然，可以从你正在做的事说起，别提系统。"
+      },
+      "dm_fallback_pool": {
+        "description": "回落语料池",
+        "hint": "LLM失败/超时随机抽一句",
+        "type": "list",
+        "default": [
+          "在吗？突然想到你了",
+          "忙不忙？闲着说两句话",
+          "想起个事，你那边怎么样",
+          "冒个泡，证明我还活着",
+          "没啥事，就是来看看你回没回消息"
+        ]
+      }
+    }
+  }
+}
