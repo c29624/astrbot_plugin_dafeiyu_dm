@@ -29,7 +29,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.2.3"
+PLUGIN_VERSION = "1.2.4"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -54,16 +54,19 @@ DEFAULTS = {
     "dm_min_gap_hours": 2.0,
     "dm_daily_cap": 4,
     "dm_morning_template": (
-        "你刚睡醒没多久，突然想跟{who}说句话。就一两句，带着刚醒的劲儿，"
-        "自然一点，别提任何系统或作息数字。"
+        "你刚睡醒没多久，想起了{who}，想主动说句话。就一两句——"
+        "说什么、什么语气按你们的相处和最近聊天的氛围自己定；"
+        "刚醒的状态自然带出来就好，不用刻意演。别提任何系统或作息数字。"
     ),
     "dm_night_template": (
-        "你马上要去睡了，睡前想跟{who}说句晚安。就一句话，困困的，"
+        "你马上要去睡了，睡前想跟{who}道个别。就一句——"
+        "晚安只是选项，说法按你们此刻聊天的氛围来；带着真实的睡意就好。"
         "别提任何系统或作息数字。"
     ),
     "dm_random_template": (
-        "你白天突然想起了{who}，想主动跟{who}说句话。一两句，"
-        "像真人突然想起对方随手发条消息那样自然，可以从你正在做的事说起，别提系统。"
+        "你白天突然想起了{who}，想主动跟{who}说句话。一两句，随手一条的自然感——"
+        "内容与语气按你们的相处和最近聊天的氛围自己定，"
+        "可以从你正在做的事、或接着最近聊过的话茬说起。别提系统。"
     ),
     "dm_fallback_pool": [
         "在吗？突然想到你了",
@@ -73,8 +76,9 @@ DEFAULTS = {
         "没啥事，就是来看看你回没回消息",
     ],
     "dm_makeup_night_template": (
-        "你刚躺下准备睡了，临睡前才想起来还没跟{who}说晚安，现在补上。"
-        "就一句话，困困的、带着点迷糊，别提任何系统或作息数字。"
+        "你刚躺下准备睡了，临睡前才想起来还没跟{who}道晚安，现在补上。"
+        "就一句——说法按你们的相处氛围来，带着点迷糊。"
+        "别提任何系统或作息数字。"
     ),
     "dm_night2_template": (
         "你们刚才已经道过晚安（或道别）了。你现在真的躺下要睡了——"
