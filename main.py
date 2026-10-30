@@ -28,7 +28,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.0.1"
+PLUGIN_VERSION = "1.0.2"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -233,15 +233,23 @@ class DafeiyuDmPlugin(Star):
     # ---------- 目标与平台 ----------
 
     def _platform_ids(self) -> list:
-        """全部可用平台 ID。配置指定了 dm_platform 就只用它"""
+        """全部可用平台 ID。配置指定了 dm_platform 就只用它。
+        注：get_insts() 返回列表（部分旧版是 dict），平台 ID 在 config["id"] 或 meta().id"""
         if self.c_platform:
             return [self.c_platform]
         pids = []
         try:
-            for inst in self.context.platform_manager.get_insts().values():
-                pid = getattr(inst, "platform_id", None) or getattr(inst, "name", None)
-                if pid and str(pid) not in pids:
-                    pids.append(str(pid))
+            insts = self.context.platform_manager.get_insts()
+            if isinstance(insts, dict):  # 兼容旧版
+                insts = insts.values()
+            for inst in insts:
+                try:
+                    pid = getattr(inst.meta(), "id", None) or (inst.config or {}).get("id")
+                except Exception:
+                    pid = (getattr(inst, "config", None) or {}).get("id")
+                pid = str(pid) if pid else None
+                if pid and pid not in pids and pid != "webchat":
+                    pids.append(pid)
         except Exception:
             pass
         return pids
