@@ -28,7 +28,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.0.1"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -141,7 +141,7 @@ class DafeiyuDmPlugin(Star):
         self._load_state()
         self._task = asyncio.create_task(self._tick_loop())
         logger.info(
-            f"[主动私聊] v{PLUGIN_VERSION} 已启动：目标={self._targets() or '（未解析到）'} "
+            f"[主动私聊] v{PLUGIN_VERSION} 已启动：目标={self._target_map() or '（未解析到）'} "
             f"晨起={'开' if self.c_morning else '关'} 睡前={'开' if self.c_night else '关'} "
             f"随机想念={self.c_random_n}次/天 上限{self.c_cap}条"
         )
@@ -232,26 +232,49 @@ class DafeiyuDmPlugin(Star):
 
     # ---------- 目标与平台 ----------
 
-    def _targets(self):
-        if self.c_targets:
-            return list(self.c_targets)
-        try:
-            admins = self.context.get_config().get("admins_id", []) or []
-            return [str(a).strip() for a in admins if str(a).strip()]
-        except Exception:
-            return []
-
-    def _platform_id(self):
+    def _platform_ids(self) -> list:
+        """全部可用平台 ID。配置指定了 dm_platform 就只用它"""
         if self.c_platform:
-            return self.c_platform
+            return [self.c_platform]
+        pids = []
         try:
             for inst in self.context.platform_manager.get_insts().values():
                 pid = getattr(inst, "platform_id", None) or getattr(inst, "name", None)
-                if pid:
-                    return str(pid)
+                if pid and str(pid) not in pids:
+                    pids.append(str(pid))
         except Exception:
             pass
-        return None
+        return pids
+
+    def _target_map(self) -> dict:
+        """{platform_id: [qq...]}。显式填了 dm_targets → 目标放首个平台（沿用旧行为）；
+        留空 → 按平台各自解析：多配置文件场景下，每个平台用它绑定配置文件的 admins_id
+        （平台没绑/绑定只到具体会话 → 回落默认配置的管理员）。"""
+        if self.c_targets:
+            pids = self._platform_ids()
+            return {pids[0]: list(self.c_targets)} if pids else {}
+        result = {}
+        for pid in self._platform_ids():
+            try:
+                cfg = self.context.get_config(umo=f"{pid}:FriendMessage:0")
+                admins = cfg.get("admins_id", []) or []
+            except Exception:
+                try:
+                    admins = self.context.get_config().get("admins_id", []) or []
+                except Exception:
+                    admins = []
+            qs = [str(a).strip() for a in admins if str(a).strip()]
+            if qs:
+                result[pid] = qs
+        return result
+
+    def _targets(self):
+        flat = []
+        for qs in self._target_map().values():
+            for q in qs:
+                if q not in flat:
+                    flat.append(q)
+        return flat
 
     # ---------- 主循环 ----------
 
@@ -341,9 +364,8 @@ class DafeiyuDmPlugin(Star):
     # ---------- 发送 ----------
 
     async def _fire(self, kind: str, template: str):
-        targets = self._targets()
-        pid = self._platform_id()
-        if not targets or not pid:
+        tmap = self._target_map()
+        if not tmap:
             logger.info(f"[主动私聊] {kind}：无可用目标/平台，跳过")
             return
         now = time.time()
@@ -353,14 +375,15 @@ class DafeiyuDmPlugin(Star):
             return
         text = await self._gen(template)
         sent_any = False
-        for qq in targets:
-            umo = f"{pid}:FriendMessage:{qq}"
-            try:
-                await self.context.send_message(umo, MessageChain().message(text))
-                sent_any = True
-                logger.info(f"[主动私聊] {kind} -> {qq}: {text[:40]}")
-            except Exception:
-                logger.warning(f"[主动私聊] {kind} 发送失败 {umo}", exc_info=True)
+        for pid, targets in tmap.items():
+            for qq in targets:
+                umo = f"{pid}:FriendMessage:{qq}"
+                try:
+                    await self.context.send_message(umo, MessageChain().message(text))
+                    sent_any = True
+                    logger.info(f"[主动私聊] {kind} -> {qq}: {text[:40]}")
+                except Exception:
+                    logger.warning(f"[主动私聊] {kind} 发送失败 {umo}", exc_info=True)
         if sent_any:
             self._st["sent_total"] = int(self._st.get("sent_total", 0)) + 1
             self._st["last_dm_ts"] = now
@@ -443,7 +466,7 @@ class DafeiyuDmPlugin(Star):
         text = await self._gen(self.tpl_random)
         try:
             sid = str(event.get_sender_id())
-            pid = self._platform_id()
+            pid = str(event.unified_msg_origin).split(":")[0]  # 发送者所在平台
             await self.context.send_message(
                 f"{pid}:FriendMessage:{sid}", MessageChain().message(text)
             )

@@ -11,13 +11,13 @@
       },
       "dm_targets": {
         "description": "发送对象 QQ 列表",
-        "hint": "留空 = 自动使用 AstrBot 管理员列表（配置里的 admins_id），装完不用填就能用；填了就只发给这些人",
+        "hint": "留空 = 自动用各平台绑定的 AstrBot 管理员列表（多配置文件场景按平台各自解析 admins_id，没绑定的平台用默认配置）；填了就只发给这些人（经首个平台发送）",
         "type": "list",
         "default": []
       },
       "dm_platform": {
         "description": "平台 ID",
-        "hint": "留空 = 自动发现第一个平台。消息格式 平台ID:FriendMessage:QQ",
+        "hint": "留空 = 自动发现平台（多平台时每个平台各自发它自己的管理员）；填了就只经这个平台发",
         "type": "string",
         "default": ""
       },
