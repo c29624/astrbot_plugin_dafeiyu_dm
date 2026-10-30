@@ -28,7 +28,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.0.2"
+PLUGIN_VERSION = "1.0.3"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -271,9 +271,9 @@ class DafeiyuDmPlugin(Star):
                     admins = self.context.get_config().get("admins_id", []) or []
                 except Exception:
                     admins = []
-            qs = [str(a).strip() for a in admins if str(a).strip()]
+            qs = list(dict.fromkeys(str(a).strip() for a in admins if str(a).strip()))
             if qs:
-                result[pid] = qs
+                result[pid] = qs  # 平台内去重；跨平台同名QQ不去重（各bot发各的管理员）
         return result
 
     def _targets(self):
