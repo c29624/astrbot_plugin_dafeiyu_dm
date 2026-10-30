@@ -14,6 +14,7 @@
 import asyncio
 import json
 import random
+import re
 import time
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
@@ -28,7 +29,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.1.3"
+PLUGIN_VERSION = "1.2.0"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -41,6 +42,7 @@ DEFAULTS = {
     "dm_platform": "",         # 留空 = 自动发现第一个平台
     "dm_owner_alias": "对方",   # 模板变量 {who}：对方怎么称呼收信人（大肥鱼填"主人"）
     "dm_alias_map": [],           # 按 QQ 配称呼：["10001=主人"]，没配的用全局
+    "dm_seg_enabled": True,      # 主动消息按句切分逐条发（拟人+防风控）
     "dm_with_context": True,    # 生成时附带该会话最近聊天记录（接话茬）
     "dm_context_count": 10,
     "dm_respect_sleep": True,
@@ -115,6 +117,7 @@ class DafeiyuDmPlugin(Star):
             except Exception:
                 continue
         self.c_with_ctx = bool(g("dm_with_context"))
+        self.c_seg_on = bool(g("dm_seg_enabled"))
         self.c_ctx_n = max(3, min(40, int(g("dm_context_count") or 10)))
         self.c_respect_sleep = bool(g("dm_respect_sleep"))
         self.c_morning = bool(g("dm_morning_on"))
@@ -443,6 +446,26 @@ class DafeiyuDmPlugin(Star):
 
     # ---------- 发送 ----------
 
+    _SEG_PAT = r".*?(?:\r?\n+|[。？！~…]+)|.+$"
+
+    def _split_text(self, text: str) -> list:
+        segs = [
+            t.strip()
+            for t in re.findall(self._SEG_PAT, text, re.DOTALL | re.MULTILINE)
+            if t.strip()
+        ]
+        return segs or [text]
+
+    async def _send_human(self, umo: str, text: str) -> None:
+        """拟人发送：按句切分逐条发；下一条的间隔=按它的长度算的打字时间
+        （每字 0.10~0.18 秒随机，下限 0.8s、上限 8s）——长句等得久，像真人输入，也防风控"""
+        segs = self._split_text(text) if self.c_seg_on else [text]
+        for i, seg in enumerate(segs):
+            if i:
+                typing = min(8.0, max(0.8, len(segs[i]) * random.uniform(0.10, 0.18)))
+                await asyncio.sleep(typing)
+            await self.context.send_message(umo, MessageChain().message(seg))
+
     async def _fire(self, kind: str, template: str) -> bool:
         """返回是否真的发出去了——调用方据此记账，没发出不销账、窗口内自动重试"""
         tmap = self._target_map()
@@ -460,7 +483,7 @@ class DafeiyuDmPlugin(Star):
                 umo = f"{pid}:FriendMessage:{qq}"
                 text = await self._gen(template, umo)  # 按目标逐个生成（上下文各不同）
                 try:
-                    await self.context.send_message(umo, MessageChain().message(text))
+                    await self._send_human(umo, text)
                     sent_any = True
                     logger.info(f"[主动私聊] {kind} -> {qq}: {text[:40]}")
                 except Exception:
@@ -612,9 +635,7 @@ class DafeiyuDmPlugin(Star):
         sid = str(event.get_sender_id())
         text = await self._gen(self.tpl_random, umo=f"{pid}:FriendMessage:{sid}")
         try:
-            await self.context.send_message(
-                f"{pid}:FriendMessage:{sid}", MessageChain().message(text)
-            )
+            await self._send_human(f"{pid}:FriendMessage:{sid}", text)
             yield event.plain_result(f"已私聊发送：{text[:60]}（测试不计入当日频控）")
         except Exception:
             yield event.plain_result("发送失败，看日志")
