@@ -65,6 +65,11 @@ https://github.com/c29624/astrbot_plugin_dafeiyu_dm
 - **1.0.1** 多配置文件适配：发送对象留空时按平台各自解析管理员——每个平台用它绑定配置文件的 `admins_id`（未绑定/只绑定到具体会话的平台回落默认配置），多 bot 多配置部署不再串门；显式填 `dm_targets` 沿用首个平台发送；`/主动私聊测试` 改经发送者所在平台发
 - **1.0.0** 首版：三类触发、作息联动、管理员回落、频控双保险、调试指令
 
+
+## 参考
+
+- [astrbot_plugin_proactive_chat](https://github.com/Pancakes-Labs/astrbot_plugin_proactive_chat)——聊天上下文注入的取法（`conversation_manager` 末尾 N 条记录进提示词）参考了它的实现，"沉默触发/防骚扰计数"的思路也受它启发；本插件与它定位不同：以作息联动为核心（晨起/睡前/睡着不打扰），主动消息内容生成各有侧重
+
 ## 许可
 
 MIT
