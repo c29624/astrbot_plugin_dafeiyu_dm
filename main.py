@@ -29,7 +29,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.2.1"
+PLUGIN_VERSION = "1.2.2"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -75,6 +75,11 @@ DEFAULTS = {
     "dm_makeup_night_template": (
         "你刚躺下准备睡了，临睡前才想起来还没跟{who}说晚安，现在补上。"
         "就一句话，困困的、带着点迷糊，别提任何系统或作息数字。"
+    ),
+    "dm_night2_template": (
+        "你们刚才已经道过晚安了。你现在真的躺下要睡了——跟{who}说一句收尾的话"
+        "（类似\"我也去睡啦\"\"真去睡了，明天见\"这种），别再说一遍晚安，"
+        "就一句，带着困意，别提任何系统或作息数字。"
     ),
 }
 
@@ -133,6 +138,7 @@ class DafeiyuDmPlugin(Star):
         self.tpl_makeup_night = str(
             g("dm_makeup_night_template")
         )
+        self.tpl_night2 = str(g("dm_night2_template"))
         pool = [str(s).strip() for s in (g("dm_fallback_pool") or []) if str(s).strip()]
         self.c_pool = pool or list(DEFAULTS["dm_fallback_pool"])
         # 当日执行状态（dm_state.json 持久化，跨重启不重发不丢计划）
@@ -481,12 +487,12 @@ class DafeiyuDmPlugin(Star):
         for pid, targets in tmap.items():
             for qq in targets:
                 umo = f"{pid}:FriendMessage:{qq}"
+                use_tpl = template
                 if kind == "night" and await self._already_said_goodnight(umo):
-                    # 聊天里已道过晚安：这个目标跳过（算"已了结"，不重试不报警）
-                    logger.info(f"[主动私聊] {kind} -> {qq}: 聊天里已道过晚安，跳过")
-                    sent_any = True
-                    continue
-                text = await self._gen(template, umo)  # 按目标逐个生成（上下文各不同）
+                    # 聊天里已道过晚安：不重复晚安，改发"去睡了"收尾话（换模板不跳过）
+                    logger.info(f"[主动私聊] {kind} -> {qq}: 已道过晚安，改发收尾话")
+                    use_tpl = self.tpl_night2
+                text = await self._gen(use_tpl, umo)  # 按目标逐个生成（上下文各不同）
                 try:
                     await self._send_human(umo, text)
                     sent_any = True
