@@ -29,7 +29,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.2.5"
+PLUGIN_VERSION = "1.2.6"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -443,6 +443,23 @@ class DafeiyuDmPlugin(Star):
             return False
         return True
 
+    async def _archive_dm(self, umo: str, text: str):
+        """把发出的主动消息归档进该会话的对话历史（user 侧只放极简标记）。
+        不归档的话，主对话上下文里"她从没说过这句"——后续回复会像失忆一样
+        重复报到（如晨起 DM 问完好、冲刷轮又演一遍刚醒）。"""
+        try:
+            cm = self.context.conversation_manager
+            cid = await cm.get_curr_conversation_id(umo)
+            if not cid:
+                return
+            await cm.add_message_pair(
+                cid=cid,
+                user_message={"role": "user", "content": "[系统标记：她主动发来下面这条私聊消息]"},
+                assistant_message={"role": "assistant", "content": text},
+            )
+        except Exception:
+            logger.warning("[主动私聊] 主动消息归档对话历史失败（不影响发送）", exc_info=True)
+
     def _consume_makeup(self):
         """补发指令文件：外部/管理往 data/makeup.json 写 {"kind":"night"} 即触发，读后即删"""
         try:
@@ -510,6 +527,7 @@ class DafeiyuDmPlugin(Star):
                     await self._send_human(umo, text)
                     sent_any = True
                     logger.info(f"[主动私聊] {kind} -> {qq}: {text[:40]}")
+                    await self._archive_dm(umo, text)
                 except Exception:
                     logger.warning(f"[主动私聊] {kind} 发送失败 {umo}", exc_info=True)
         if sent_any:
