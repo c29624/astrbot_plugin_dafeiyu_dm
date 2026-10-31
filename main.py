@@ -31,7 +31,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.5.3"
+PLUGIN_VERSION = "1.5.5"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -141,6 +141,8 @@ DEFAULTS = {
     "miss_promise_words": ["晚点找你", "等会找你", "等会儿找你", "待会找你", "待会聊", "晚上找你", "晚上聊", "回头找你", "回来找你"],
     "miss_night_words": ["晚安", "睡了", "先睡", "去睡", "睡觉啦", "睡觉了", "睡啦"],  # 你先道别→她躺下必收尾（不因她睡晚漏掉）
     "miss_night_words_from": "20:00",  # 道别词从几点开始算数（再配合同晚8h闸双保险）
+    "miss_together_words": ["一起", "连麦", "牵着", "抱着", "陪你"],  # 在一起语境词：窗口内主动话术避开"想你/等你"防穿帮
+    "miss_together_min": 150,          # 在一起语境持续分钟（10~480 夹取）
     "miss_mute_words": ["别发了", "别找我", "别烦我", "烦不烦", "让我静静"],
     "miss_mute_days": 3,              # 显式抑制持续天数（或主动开话2次解冻）
     "miss_jitter": "10-40",           # 抖动期"低-高"（分钟），可 0-0
@@ -310,6 +312,8 @@ class DafeiyuDmPlugin(Star):
         self.c_promise_words = [str(w).strip() for w in (g("miss_promise_words") or []) if str(w).strip()]
         self.c_night_words = [str(w).strip() for w in (g("miss_night_words") or []) if str(w).strip()]
         self.c_night_from = _parse_hhmm(g("miss_night_words_from"))
+        self.c_together_words = [str(w).strip() for w in (g("miss_together_words") or []) if str(w).strip()]
+        self.c_together_min = min(480, max(10, int(g("miss_together_min") or 150)))
         self.c_night_from = 20 * 60 if self.c_night_from is None else self.c_night_from
         self.c_mute_words = [str(w).strip() for w in (g("miss_mute_words") or []) if str(w).strip()]
         self.c_mute_days = min(30, max(1, int(g("miss_mute_days") or 3)))
@@ -661,6 +665,12 @@ class DafeiyuDmPlugin(Star):
                 dt = datetime.fromtimestamp(now)
                 if dt.hour * 60 + dt.minute >= self.c_night_from and any(w in text for w in self.c_night_words):
                     s["goodnight_ts"] = now
+            # 在一起语境：对方说过"一起/连麦…"——窗口内她的主动话术避开"想你/等你"防穿帮
+            if self.c_together_words:
+                hit = next((w for w in self.c_together_words if w in text), None)
+                if hit:
+                    s["together_ts"] = now
+                    s["together_word"] = hit
             # 存稿：睡眠期来言（自己的记录，不依赖 sleep 缓冲内部结构）
             if self._sleep_phase() == "sleeping":
                 s["night_in"][datetime.now().date().isoformat()] = True
@@ -840,8 +850,32 @@ class DafeiyuDmPlugin(Star):
                    "heat": round(f_heat, 2), "afk": f_afk, "floor": self.c_floor,
                    "mood": float(self._st.get("mood", 1.0))}
 
+    def _together_now(self, umo: str, now: float) -> tuple:
+        """(是否处于'在一起'语境, 命中词, 已过分钟)。词表清空=功能关。"""
+        s = self._sess(umo)
+        ts = float(s.get("together_ts") or 0)
+        if not ts or not self.c_together_words:
+            return False, "", 0
+        elapsed = now - ts
+        if 0 <= elapsed <= self.c_together_min * 60:
+            return True, str(s.get("together_word") or ""), int(elapsed // 60)
+        return False, "", 0
+
+    def _together_ctx(self, umo: str, now: float) -> str:
+        """在一起语境的事实行（喂内心戏与正文，话术防穿帮；不动概率）"""
+        tg, word, mins = self._together_now(umo, now)
+        if not tg:
+            return ""
+        return (
+            f"[背景事实：约{mins}分钟前对方说过「{word}」——你们可能正连着麦/一起玩/待在一块。"
+            f"别说「想你」「等你回来」这种分开才说的话；像陪在旁边那样随口聊眼前的事就行。]\n"
+        )
+
     def _scenario_tag(self, umo: str, tier: str) -> str:
         s = self._sess(umo)
+        tg, _, _ = self._together_now(umo, time.time())
+        if tg:
+            return "在一起"
         days = 0
         fires = [d for d in (s.get("fires") or []) if d]
         if fires:
@@ -1314,7 +1348,8 @@ class DafeiyuDmPlugin(Star):
             text = await self._gen(
                 self.tpl_miss_random, umo=umo, kind="random",
                 veto_ok=self.c_ai_veto,
-                veto_ctx=self._status_ctx(umo) + f"[本次情景：{tag}（{'去吃饭离席' if tier=='afk' else '约定未赴' if tier=='promise' else '聊嗨断线' if tier=='hot' else '普通冷场'}）]\n",
+                veto_ctx=self._status_ctx(umo) + self._together_ctx(umo, now)
+                    + f"[本次情景：{tag}（{'去吃饭离席' if tier=='afk' else '约定未赴' if tier=='promise' else '聊嗨断线' if tier=='hot' else '普通冷场'}）]\n",
                 scenario=tag,
             )
             status = self._last_gen_status
