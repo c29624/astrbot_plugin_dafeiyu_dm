@@ -29,7 +29,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.3.5"
+PLUGIN_VERSION = "1.3.6"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -903,6 +903,35 @@ class DafeiyuDmPlugin(Star):
             + "\n\n"
             "配置：面板 → 主动私聊 → 触发 → 对应白名单（留空=全部）"
         )
+
+        # 优先发"聊天记录"（合并转发）：不占聊天空间；每个插件一节、白名单收尾。
+        # 转发组件不可用/发送失败时回落分段纯文本
+        try:
+            from astrbot.core.message.components import Node, Nodes, Plain as _Plain
+
+            try:
+                self_id = str(event.get_self_id())
+            except Exception:
+                self_id = "0"
+            try:
+                self_name = str(event.get_self_name() or "bot")
+            except Exception:
+                self_name = "bot"
+            node_list = [
+                Node(
+                    content=[_Plain("🧰 主动私聊 · 可用工具清单（每节一个插件）")],
+                    name=self_name,
+                    uin=self_id,
+                )
+            ]
+            node_list += [
+                Node(content=[_Plain(b)], name=self_name, uin=self_id) for b in blocks
+            ]
+            node_list.append(Node(content=[_Plain(tail)], name=self_name, uin=self_id))
+            yield event.chain_result([Nodes(node_list)])
+            return
+        except Exception:
+            logger.warning("[主动私聊] 转发消息发送失败，回落纯文本", exc_info=True)
 
         # QQ 客户端会折叠空行——分隔用真实字符的分隔线，怎么折叠都看得见
         SEP = "\n————————————\n"
