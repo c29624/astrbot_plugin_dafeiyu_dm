@@ -29,7 +29,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.3.7"
+PLUGIN_VERSION = "1.3.8"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -110,7 +110,7 @@ def _parse_hhmm(value):
 @register(
     PLUGIN_NAME,
     "29624",
-    "主动私聊：晨起/睡前/随机想念，联动睡觉插件作息，她睡着不打扰",
+    "主动私聊：晨起/睡前/随机想念，联动睡觉插件作息，她睡着不打扰；可挂任意llm工具",
     PLUGIN_VERSION,
 )
 class DafeiyuDmPlugin(Star):
