@@ -31,7 +31,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.5.2"
+PLUGIN_VERSION = "1.5.3"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -140,6 +140,7 @@ DEFAULTS = {
     "miss_afk_words": ["吃饭", "干饭", "洗澡", "洗漱", "出门", "取快递", "上课", "上班", "下班", "加班", "打游戏"],
     "miss_promise_words": ["晚点找你", "等会找你", "等会儿找你", "待会找你", "待会聊", "晚上找你", "晚上聊", "回头找你", "回来找你"],
     "miss_night_words": ["晚安", "睡了", "先睡", "去睡", "睡觉啦", "睡觉了", "睡啦"],  # 你先道别→她躺下必收尾（不因她睡晚漏掉）
+    "miss_night_words_from": "20:00",  # 道别词从几点开始算数（再配合同晚8h闸双保险）
     "miss_mute_words": ["别发了", "别找我", "别烦我", "烦不烦", "让我静静"],
     "miss_mute_days": 3,              # 显式抑制持续天数（或主动开话2次解冻）
     "miss_jitter": "10-40",           # 抖动期"低-高"（分钟），可 0-0
@@ -308,6 +309,8 @@ class DafeiyuDmPlugin(Star):
         self.c_afk_words = [str(w).strip() for w in (g("miss_afk_words") or []) if str(w).strip()]
         self.c_promise_words = [str(w).strip() for w in (g("miss_promise_words") or []) if str(w).strip()]
         self.c_night_words = [str(w).strip() for w in (g("miss_night_words") or []) if str(w).strip()]
+        self.c_night_from = _parse_hhmm(g("miss_night_words_from"))
+        self.c_night_from = 20 * 60 if self.c_night_from is None else self.c_night_from
         self.c_mute_words = [str(w).strip() for w in (g("miss_mute_words") or []) if str(w).strip()]
         self.c_mute_days = min(30, max(1, int(g("miss_mute_days") or 3)))
         self.c_jitter_lo, self.c_jitter_hi = self._parse_jitter(g("miss_jitter"))
@@ -653,9 +656,10 @@ class DafeiyuDmPlugin(Star):
                 hit = next((w for w in self.c_promise_words if w in text), None)
                 if hit:
                     s["promise"] = {"word": hit, "event": now}
-            # 你先道了别：记下时刻（20点后算数，防白天误伤）——她睡得再晚，躺下也必收尾
-            if self.c_night_words and datetime.fromtimestamp(now).hour >= 20:
-                if any(w in text for w in self.c_night_words):
+            # 你先道了别：记下时刻（起点时刻后算数，防白天误伤）——她睡得再晚，躺下也必收尾
+            if self.c_night_words:
+                dt = datetime.fromtimestamp(now)
+                if dt.hour * 60 + dt.minute >= self.c_night_from and any(w in text for w in self.c_night_words):
                     s["goodnight_ts"] = now
             # 存稿：睡眠期来言（自己的记录，不依赖 sleep 缓冲内部结构）
             if self._sleep_phase() == "sleeping":
