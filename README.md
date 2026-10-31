@@ -93,6 +93,12 @@ https://github.com/c29624/astrbot_plugin_dafeiyu_dm
 - [astrbot_plugin_dafeiyu_sleep · 随机睡觉](https://github.com/c29624/astrbot_plugin_dafeiyu_sleep)——**作息联动的核心**：本插件直读它的状态文件，实现"她睡着绝不发消息、晨起/睡前跟着真实作息走"。不装也能跑（退化为纯时间窗模式）
 - [astrbot_plugin_dafeiyu_merge · 私聊聚合](https://github.com/c29624/astrbot_plugin_dafeiyu_merge)——私聊侧配套：连发消息合并成一次回复 + 私聊分段发送；本插件的主动消息同样按句分段、打字时间间隔拟人发送
 
+## 路线图（Roadmap）
+
+- **[v1.3] 主动消息工具调用**（规划中）：主动私聊生成时可挂载任意已注册的 llm_tool（点歌、画图、搜索……装了什么用什么，不绑定具体插件）——管理员白名单选择放行哪些工具（留空=全部），模型按当轮心情与上下文自主决定是否使用（比如"放一首符合我现在心情的歌"）。默认关闭、opt-in 开启
+  - 待调研：管线外（无消息事件）执行工具的环境要求；返回值型/副作用型工具的兼容差异
+- 已完成：作息联动 / 聊天上下文 / 拟人分段 / 归档对话历史 / 防重复 / 补发通道 / 多配置管理员并集 / 按 QQ 称呼
+
 ## 参考
 
 - [astrbot_plugin_proactive_chat](https://github.com/Pancakes-Labs/astrbot_plugin_proactive_chat)——聊天上下文注入的取法（`conversation_manager` 末尾 N 条记录进提示词）参考了它的实现，"沉默触发/防骚扰计数"的思路也受它启发；本插件与它定位不同：以作息联动为核心（晨起/睡前/睡着不打扰），主动消息内容生成各有侧重
