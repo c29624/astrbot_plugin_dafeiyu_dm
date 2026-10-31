@@ -29,7 +29,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.3.2"
+PLUGIN_VERSION = "1.3.3"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -869,17 +869,17 @@ class DafeiyuDmPlugin(Star):
             groups.setdefault(plugin, []).append(f"· {name} — {desc}{state}")
         if not groups:
             groups = {"（当前没有任何已注册的工具）": []}
-        body = "\n".join(
+        # 每个插件一个小节，节与节之间空一行；单条消息超长自动分段（QQ 长文本上限约 4500，
+        # 保守 1600 分段，分段只在节/行边界切，不撕断行）
+        blocks = [
             (f"【{g}】\n" + "\n".join(ts)) if ts else f"【{g}】" for g, ts in groups.items()
-        )
+        ]
 
         def _line(label, on, names):
             lst = f"：{'、'.join(names)}" if names else "：空 = 全部工具"
             return f"· {label}（{'开' if on else '关'}）{lst}"
 
-        yield event.plain_result(
-            "🧰 主动私聊 · 可用工具\n"
-            f"{body}\n\n"
+        tail = (
             "📋 当前白名单\n"
             + _line("晨起", self.c_tools_morning_on, self.c_tools_morning_names)
             + "\n"
@@ -889,6 +889,23 @@ class DafeiyuDmPlugin(Star):
             + "\n\n"
             "配置：面板 → 主动私聊 → 触发 → 对应白名单（留空=全部）"
         )
+
+        MAX_LEN = 1600
+        chunks, cur = [], "🧰 主动私聊 · 可用工具\n"
+        for b in blocks:
+            add = ("\n\n" if len(cur) > len("🧰 主动私聊 · 可用工具\n") else "") + b
+            if len(cur) + len(add) > MAX_LEN:
+                chunks.append(cur)
+                cur = "🧰 主动私聊 · 可用工具（续）\n" + b
+            else:
+                cur += add
+        if len(cur) + 2 + len(tail) > MAX_LEN:
+            chunks.append(cur)
+            chunks.append(tail)
+        else:
+            chunks.append(cur + "\n\n" + tail)
+        for c in chunks:
+            yield event.plain_result(c)
 
     @filter.command("主动私聊测试")
     async def cmd_test(self, event: AstrMessageEvent):
