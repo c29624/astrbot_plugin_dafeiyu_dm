@@ -88,6 +88,11 @@ https://github.com/c29624/astrbot_plugin_dafeiyu_dm
 - **1.0.0** 首版：三类触发、作息联动、管理员回落、频控双保险、调试指令
 
 
+## 生态搭配（同一作者的配套插件）
+
+- [astrbot_plugin_dafeiyu_sleep · 随机睡觉](https://github.com/c29624/astrbot_plugin_dafeiyu_sleep)——**作息联动的核心**：本插件直读它的状态文件，实现"她睡着绝不发消息、晨起/睡前跟着真实作息走"。不装也能跑（退化为纯时间窗模式）
+- [astrbot_plugin_dafeiyu_merge · 私聊聚合](https://github.com/c29624/astrbot_plugin_dafeiyu_merge)——私聊侧配套：连发消息合并成一次回复 + 私聊分段发送；本插件的主动消息同样按句分段、打字时间间隔拟人发送
+
 ## 参考
 
 - [astrbot_plugin_proactive_chat](https://github.com/Pancakes-Labs/astrbot_plugin_proactive_chat)——聊天上下文注入的取法（`conversation_manager` 末尾 N 条记录进提示词）参考了它的实现，"沉默触发/防骚扰计数"的思路也受它启发；本插件与它定位不同：以作息联动为核心（晨起/睡前/睡着不打扰），主动消息内容生成各有侧重
