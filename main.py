@@ -29,7 +29,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.3.3"
+PLUGIN_VERSION = "1.3.4"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -836,25 +836,26 @@ class DafeiyuDmPlugin(Star):
         )
 
     @filter.command("主动私聊工具")
-    async def cmd_tools(self, event: AstrMessageEvent):
+    async def cmd_tools(self, event: AstrMessageEvent, args=None):
         """列出当前所有可用的 llm_tool（按插件分组·名字·说明），
-        供配置三路白名单时照抄——解决"用户不知道工具叫什么"的问题"""
+        供配置三路白名单时照抄。默认只列启用中的工具（禁用的刷屏且配了也不生效），
+        带"全部"参数才展开禁用项"""
         if not self._is_admin(event):
             yield event.plain_result("没权限")
             return
+        show_all = any(k in str(args or "") for k in ("全部", "all", "含禁用"))
         try:
             full = self.context.get_llm_tool_manager().get_full_tool_set()
             tools = list(getattr(full, "tools", None) or [])
         except Exception:
             yield event.plain_result("工具管理器不可用，看日志")
             return
-        # 按插件分组（手机上无等宽字体，分组小标题比一行塞插件名可读）
+        # 按插件分组；禁用项聚合为每组一行尾注（默认隐藏——白名单过滤本就不放行它们）
         groups: dict = {}
+        disabled_count: dict = {}
         for t in tools:
             name = getattr(t, "name", "?")
-            desc = (getattr(t, "description", "") or "").strip().split("\n")[0][:36]
-            if not desc:
-                desc = "（无描述）"
+            active = getattr(t, "active", True)
             plugin = "其他"
             mod = getattr(t, "handler_module_path", None)
             if mod:
@@ -865,8 +866,21 @@ class DafeiyuDmPlugin(Star):
                     plugin = getattr(p, "display_name", None) or getattr(p, "name", "") or "其他"
                 except Exception:
                     pass
-            state = "" if getattr(t, "active", True) else "（已禁用）"
+            if not active:
+                disabled_count[plugin] = disabled_count.get(plugin, 0) + 1
+                if not show_all:
+                    continue
+            desc = (getattr(t, "description", "") or "").strip().split("\n")[0]
+            if len(desc) > 24:
+                desc = desc[:24] + "…"
+            if not desc:
+                desc = "（无描述）"
+            state = "" if active else "（禁）"
             groups.setdefault(plugin, []).append(f"· {name} — {desc}{state}")
+        # 禁用尾注
+        for g, n in disabled_count.items():
+            if not show_all:
+                groups.setdefault(g, []).append(f"（另有 {n} 个已禁用，发「主动私聊工具 全部」展开）")
         if not groups:
             groups = {"（当前没有任何已注册的工具）": []}
         # 每个插件一个小节，节与节之间空一行；单条消息超长自动分段（QQ 长文本上限约 4500，
