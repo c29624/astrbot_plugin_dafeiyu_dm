@@ -31,7 +31,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.5.5"
+PLUGIN_VERSION = "1.5.6"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -726,14 +726,7 @@ class DafeiyuDmPlugin(Star):
         st = self._sleep_state()
         if st:
             wake_ts = float(st.get("wake_at") or 0)
-            night = st.get("night") or {}
-            bed_ts = 0.0
-            if str(night.get("anchor") or "") == datetime.now().date().isoformat():
-                bed_ts = float(night.get("bed_ts") or 0)  # night.anchor=今天 → 这是今晚的计划
-            if not bed_ts:
-                sw = st.get("sleep_window") or []
-                if sw and float(sw[0]) > time.time():
-                    bed_ts = float(sw[0])
+            bed_ts = self._night_bed_from_state(st, time.time())
             if wake_ts and bed_ts and bed_ts > wake_ts:
                 lo = (datetime.fromtimestamp(wake_ts + 3600))
                 hi = (datetime.fromtimestamp(bed_ts - 1800))
@@ -1106,17 +1099,23 @@ class DafeiyuDmPlugin(Star):
                 self._dlog({"t": "reply_none", "umo": umo.split(":")[-1], "factor": self.c_reply_none_f})
         self._save_state()
 
-    def _tonight_bed_ts(self, sl: dict, now: float) -> float:
-        """今晚入睡点：night.anchor=今天→night.bed_ts；否则用未来的 sleep_window[0]"""
-        night = sl.get("night") or {}
-        if str(night.get("anchor") or "") == datetime.now().date().isoformat():
-            b = float(night.get("bed_ts") or 0)
-            if b:
-                return b
-        sw = sl.get("sleep_window") or []
+    def _night_bed_from_state(self, st: dict, now: float) -> float:
+        """从睡觉插件状态取"当前这一夜的入睡点"。night.bed_ts 落在[现在-16h, 现在+18h]
+        即采信——sleep 的 anchor 是傍晚日期，床点跨午夜后（如 02:16）anchor≠"今天"，
+        拿日期相等判会把跨午夜晚的床点读丢（v1.5.6 修复：睡前晚安/评估时段跨午夜灭）；
+        采信不了再用未来的 sleep_window[0]，都没有返回 0"""
+        night = st.get("night") or {}
+        b = float(night.get("bed_ts") or 0)
+        if b and now - 16 * 3600 <= b <= now + 18 * 3600:
+            return b
+        sw = st.get("sleep_window") or []
         if sw and float(sw[0]) > now:
             return float(sw[0])
         return 0.0
+
+    def _tonight_bed_ts(self, sl: dict, now: float) -> float:
+        """今晚入睡点（判定见 _night_bed_from_state）"""
+        return self._night_bed_from_state(sl, now)
 
     async def _morning_decide(self, m: dict, wake_ts: float, now: float):
         """晨起决策：存稿→让位冲刷；用户先开口→跳过；锚点必发；概率分支掷骰"""
