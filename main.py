@@ -31,7 +31,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.5.0"
+PLUGIN_VERSION = "1.5.1"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -42,6 +42,7 @@ QUIET_HARD_LO = 8 * 60    # 评估时段硬边界 08:00
 QUIET_HARD_HI = 23 * 60 + 30  # …~23:30（风控：深夜不评估不发送）
 EVENT_WOBBLE_MIN = 0.0  # 事件级微抖 0~5 分钟（内置常量，防掐表底裤，不可配）
 EVENT_WOBBLE_MAX = 5.0
+AFK_GRACE_MIN = 5.0  # 离席/约定词宽限：词说出后对话在5分钟内结束→仍按该档（"吃饭啦""拜拜"分开发不丢档）
 MOOD_STEP = 0.15        # 心情节律随机游走幅度 ±15%
 DRIFT_STEP = 0.20       # 每日参数微扰幅度 ±20%
 
@@ -782,9 +783,12 @@ class DafeiyuDmPlugin(Star):
         ev = float(s.get("act_ts") or 0)
         afk = s.get("afk") or {}
         promise = s.get("promise") or {}
-        if promise and float(promise.get("event") or 0) == ev:
+        grace = AFK_GRACE_MIN * 60
+        # 词的event是"说出词那条消息"的时刻；分开发"吃饭啦""拜拜"时最后一条≠说词条
+        # ——距词不超过宽限期仍认（聊超过宽限才安静=人没走，回落普通档）
+        if promise and 0 <= ev - float(promise.get("event") or -1) <= grace:
             tier = "promise"   # 约定未赴 → 中档
-        elif afk and float(afk.get("event") or 0) == ev:
+        elif afk and 0 <= ev - float(afk.get("event") or -1) <= grace:
             tier = "afk"       # 离席词 → 吃饭档
         elif rounds >= self.c_heat_hot_min and s.get("act_from") == "user":
             tier = "hot"       # 聊嗨断线无交代 → 中档
