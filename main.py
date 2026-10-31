@@ -29,7 +29,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.2.6"
+PLUGIN_VERSION = "1.3.0"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -43,6 +43,12 @@ DEFAULTS = {
     "dm_owner_alias": "对方",   # 模板变量 {who}：对方怎么称呼收信人（大肥鱼填"主人"）
     "dm_alias_map": [],           # 按 QQ 配称呼：["10001=主人"]，没配的用全局
     "dm_seg_enabled": True,      # 主动消息按句切分逐条发（拟人+防风控）
+    "dm_tools_morning_on": False,   # 晨起问候允许模型调工具（默认关）
+    "dm_tools_morning_names": [],   # 晨起工具白名单，空=全部已注册
+    "dm_tools_night_on": False,     # 睡前晚安允许工具（补发同此）
+    "dm_tools_night_names": [],
+    "dm_tools_random_on": False,    # 随机想念允许工具
+    "dm_tools_random_names": [],
     "dm_with_context": True,    # 生成时附带该会话最近聊天记录（接话茬）
     "dm_context_count": 10,
     "dm_respect_sleep": True,
@@ -128,6 +134,13 @@ class DafeiyuDmPlugin(Star):
                 continue
         self.c_with_ctx = bool(g("dm_with_context"))
         self.c_seg_on = bool(g("dm_seg_enabled"))
+        # 工具调用（v1.3.0）：三路独立，各自开关+白名单（空=全部已注册 llm_tool）
+        self.c_tools_morning_on = bool(g("dm_tools_morning_on"))
+        self.c_tools_morning_names = [str(n).strip() for n in (g("dm_tools_morning_names") or []) if str(n).strip()]
+        self.c_tools_night_on = bool(g("dm_tools_night_on"))
+        self.c_tools_night_names = [str(n).strip() for n in (g("dm_tools_night_names") or []) if str(n).strip()]
+        self.c_tools_random_on = bool(g("dm_tools_random_on"))
+        self.c_tools_random_names = [str(n).strip() for n in (g("dm_tools_random_names") or []) if str(n).strip()]
         self.c_ctx_n = max(3, min(40, int(g("dm_context_count") or 10)))
         self.c_respect_sleep = bool(g("dm_respect_sleep"))
         self.c_morning = bool(g("dm_morning_on"))
@@ -522,7 +535,7 @@ class DafeiyuDmPlugin(Star):
                         logger.info(f"[主动私聊] {kind} -> {qq}: 用户已先开口，跳过（冲刷已带出晨间内容）")
                         sent_any = True
                         continue
-                text = await self._gen(use_tpl, umo)  # 按目标逐个生成（上下文各不同）
+                text = await self._gen(use_tpl, umo, kind=kind)  # 按目标逐个生成（上下文/工具各不同）
                 try:
                     await self._send_human(umo, text)
                     sent_any = True
@@ -640,8 +653,99 @@ class DafeiyuDmPlugin(Star):
         except Exception:
             return ""
 
-    async def _gen(self, template: str, umo: str = "") -> str:
-        """首选 LLM 临场生成（现用人设 + 最近聊天上下文 + 当前时间）；失败/超时回落语料池"""
+    # ---------- 工具调用（v1.3.0）：合成事件 + tool_loop_agent + 白名单过滤 ----------
+
+    _TOOL_HINT = "（如有可用的工具，按你的判断使用）"
+
+    def _tools_for(self, kind: str):
+        """按触发类型取工具子集。返回 (ToolSet或None, 是否启用)。
+        三路独立：dm_tools_morning / night / random；开关关或工具集空 → None（纯文本生成）"""
+        cfg = {
+            "morning": (self.c_tools_morning_on, self.c_tools_morning_names),
+            "night": (self.c_tools_night_on, self.c_tools_night_names),
+            "makeup": (self.c_tools_night_on, self.c_tools_night_names),  # 补发跟随睡前
+            "random": (self.c_tools_random_on, self.c_tools_random_names),
+        }.get(kind)
+        if not cfg or not cfg[0]:
+            return None
+        try:
+            mgr = self.context.get_llm_tool_manager()
+            full = mgr.get_full_tool_set()
+        except Exception:
+            logger.warning("[主动私聊] 取工具集失败，本轮纯文本", exc_info=True)
+            return None
+        allow = {str(n).strip() for n in (cfg[1] or []) if str(n).strip()}
+        from astrbot.core.agent.tool import ToolSet
+
+        subset = ToolSet()
+        try:
+            for t in getattr(full, "tools", None) or []:
+                if not getattr(t, "active", True):
+                    continue  # 未激活/被禁的工具一律不放行（空名单=全部"已激活"工具）
+                name = getattr(t, "name", None) or getattr(t, "handler_name", "")
+                if allow and name not in allow:
+                    continue
+                subset.add_tool(t)
+        except Exception:
+            logger.warning("[主动私聊] 工具白名单过滤失败，本轮纯文本", exc_info=True)
+            return None
+        if subset.empty():
+            logger.info(f"[主动私聊] {kind} 白名单未命中任何已注册工具，本轮纯文本")
+            return None
+        return subset
+
+    def _synthetic_event(self, umo: str):
+        """构造合成事件（参照框架 CronMessageEvent 的做法）：
+        工具 handler 需要 event（读会话/发卡片），dm 是定时器触发没有真事件——
+        造一个指向目标私聊会话的假事件，副作用型工具的 event.send 会路由到真实会话"""
+        try:
+            from astrbot.core.cron.events import CronMessageEvent
+            from astrbot.core.platform.message_session import MessageSession
+
+            session = MessageSession.from_str(umo)
+            return CronMessageEvent(
+                context=self.context,
+                session=session,
+                message="[主动消息任务]",
+                sender_name=PLUGIN_NAME,
+            )
+        except Exception:
+            logger.warning("[主动私聊] 合成事件构造失败，工具不可用本轮", exc_info=True)
+            return None
+
+    async def _gen_with_tools(self, prompt: str, umo: str, tools) -> str:
+        """带工具循环的生成：模型可自主调用白名单工具（执行由框架 agent 循环完成），
+        最终返回完整文本。失败抛异常由调用方回落。"""
+        ev = self._synthetic_event(umo)
+        if ev is None:
+            raise RuntimeError("合成事件构造失败")
+        prov_id = None
+        try:
+            prov_id = await self.context.get_current_chat_provider_id(umo)
+        except Exception:
+            pass
+        if not prov_id:
+            try:
+                p = await self.context.get_using_provider_async(None)
+                prov_id = p.meta().id
+            except Exception:
+                raise RuntimeError("无法确定聊天 provider")
+        resp = await asyncio.wait_for(
+            self.context.tool_loop_agent(
+                event=ev,
+                chat_provider_id=prov_id,
+                prompt=prompt + "\n" + self._TOOL_HINT,
+                tools=tools,
+                max_steps=4,
+                tool_call_timeout=90,
+            ),
+            timeout=150,
+        )
+        return str(getattr(resp, "completion_text", "") or "").strip()
+
+    async def _gen(self, template: str, umo: str = "", kind: str = "") -> str:
+        """首选 LLM 临场生成（现用人设 + 最近聊天上下文 + 当前时间）；
+        kind 对应触发配置了可用工具时走带工具的 agent 循环；失败/超时回落语料池"""
         who = self.c_alias
         try:
             qq = umo.split(":")[2] if umo else ""
@@ -676,6 +780,16 @@ class DafeiyuDmPlugin(Star):
                     + now_line
                     + prompt_tpl
                 )
+                # 工具分支：该触发类型配置了工具 → 带工具循环生成（耗时更长，超时放宽）
+                tools = self._tools_for(kind) if kind else None
+                if tools is not None:
+                    try:
+                        text = await self._gen_with_tools(prompt, umo, tools)
+                        if text:
+                            return text[:200]
+                        logger.info("[主动私聊] 工具循环无文本产出，回落纯文本生成")
+                    except Exception:
+                        logger.warning("[主动私聊] 工具生成失败，回落纯文本", exc_info=True)
                 resp = await asyncio.wait_for(
                     provider.text_chat(prompt=prompt, session_id=f"{PLUGIN_NAME}_gen"),
                     timeout=25,
@@ -730,7 +844,7 @@ class DafeiyuDmPlugin(Star):
         umo = str(event.unified_msg_origin)
         pid = umo.split(":")[0]  # 发送者所在平台
         sid = str(event.get_sender_id())
-        text = await self._gen(self.tpl_random, umo=f"{pid}:FriendMessage:{sid}")
+        text = await self._gen(self.tpl_random, umo=f"{pid}:FriendMessage:{sid}", kind="random")
         try:
             await self._send_human(f"{pid}:FriendMessage:{sid}", text)
             yield event.plain_result(f"已私聊发送：{text[:60]}（测试不计入当日频控）")

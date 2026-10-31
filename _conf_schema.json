@@ -124,6 +124,42 @@
         "hint": "主动消息按句末标点/换行切分逐条发；下一条的间隔按其长度算的打字时间（每字0.10~0.18秒，0.8~8秒夹取）——像真人输入，防风控。关=整条一条发",
         "type": "bool",
         "default": true
+      },
+      "dm_tools_morning_on": {
+        "description": "晨起问候·允许工具",
+        "hint": "开=晨起问候的生成可挂载工具（模型自主决定是否使用）；关=纯文本。补发通道跟随睡前配置",
+        "type": "bool",
+        "default": false
+      },
+      "dm_tools_morning_names": {
+        "description": "晨起问候·工具白名单",
+        "hint": "留空=全部已注册 llm_tool；填工具名=只放行这些。工具名见各插件的 llm_tool 注册名（面板→插件→函数工具可见）",
+        "type": "list",
+        "default": []
+      },
+      "dm_tools_night_on": {
+        "description": "睡前晚安·允许工具",
+        "hint": "开=睡前晚安的生成可挂载工具（模型自主决定是否使用）；关=纯文本。补发通道跟随睡前配置",
+        "type": "bool",
+        "default": false
+      },
+      "dm_tools_night_names": {
+        "description": "睡前晚安·工具白名单",
+        "hint": "留空=全部已注册 llm_tool；填工具名=只放行这些。工具名见各插件的 llm_tool 注册名（面板→插件→函数工具可见）",
+        "type": "list",
+        "default": []
+      },
+      "dm_tools_random_on": {
+        "description": "随机想念·允许工具",
+        "hint": "开=随机想念的生成可挂载工具（模型自主决定是否使用）；关=纯文本。补发通道跟随睡前配置",
+        "type": "bool",
+        "default": false
+      },
+      "dm_tools_random_names": {
+        "description": "随机想念·工具白名单",
+        "hint": "留空=全部已注册 llm_tool；填工具名=只放行这些。工具名见各插件的 llm_tool 注册名（面板→插件→函数工具可见）",
+        "type": "list",
+        "default": []
       }
     }
   },
