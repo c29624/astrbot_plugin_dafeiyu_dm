@@ -29,7 +29,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.3.6"
+PLUGIN_VERSION = "1.3.7"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -851,7 +851,9 @@ class DafeiyuDmPlugin(Star):
             yield event.plain_result("工具管理器不可用，看日志")
             return
         # 按插件分组；禁用项聚合为每组一行尾注（默认隐藏——白名单过滤本就不放行它们）
+        # 两套行文：full（转发节点用，完整介绍——折叠的不占地方）/ short（回落纯文本用，24字截断）
         groups: dict = {}
+        groups_short: dict = {}
         disabled_count: dict = {}
         for t in tools:
             name = getattr(t, "name", "?")
@@ -870,23 +872,30 @@ class DafeiyuDmPlugin(Star):
                 disabled_count[plugin] = disabled_count.get(plugin, 0) + 1
                 if not show_all:
                     continue
-            desc = (getattr(t, "description", "") or "").strip().split("\n")[0]
-            if len(desc) > 24:
-                desc = desc[:24] + "…"
-            if not desc:
-                desc = "（无描述）"
+            raw = (getattr(t, "description", "") or "").strip()
+            full = "；".join(x for x in raw.split("\n") if x.strip())[:400] or "（无描述）"
+            short = raw.split("\n")[0][:24] + ("…" if len(raw.split("\n")[0]) > 24 else "")
+            if not short:
+                short = "（无描述）"
             state = "" if active else "（禁）"
-            groups.setdefault(plugin, []).append(f"· {name} — {desc}{state}")
+            groups.setdefault(plugin, []).append(f"· {name} — {full}{state}")
+            groups_short.setdefault(plugin, []).append(f"· {name} — {short}{state}")
         # 禁用尾注
         for g, n in disabled_count.items():
             if not show_all:
-                groups.setdefault(g, []).append(f"（另有 {n} 个已禁用，发「主动私聊工具 全部」展开）")
+                note = f"（另有 {n} 个已禁用，发「主动私聊工具 全部」展开）"
+                groups.setdefault(g, []).append(note)
+                groups_short.setdefault(g, []).append(note)
         if not groups:
             groups = {"（当前没有任何已注册的工具）": []}
+            groups_short = groups
         # 每个插件一个小节，节与节之间空一行；单条消息超长自动分段（QQ 长文本上限约 4500，
         # 保守 1600 分段，分段只在节/行边界切，不撕断行）
         blocks = [
             (f"【{g}】\n" + "\n".join(ts)) if ts else f"【{g}】" for g, ts in groups.items()
+        ]
+        blocks_short = [
+            (f"【{g}】\n" + "\n".join(ts)) if ts else f"【{g}】" for g, ts in groups_short.items()
         ]
 
         def _line(label, on, names):
@@ -937,7 +946,7 @@ class DafeiyuDmPlugin(Star):
         SEP = "\n————————————\n"
         MAX_LEN = 1600
         chunks, cur = [], "🧰 主动私聊 · 可用工具\n"
-        for b in blocks:
+        for b in blocks_short:
             add = (SEP if len(cur) > len("🧰 主动私聊 · 可用工具\n") else "") + b
             if len(cur) + len(add) > MAX_LEN:
                 chunks.append(cur)
