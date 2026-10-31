@@ -29,7 +29,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.2.4"
+PLUGIN_VERSION = "1.2.5"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -497,6 +497,14 @@ class DafeiyuDmPlugin(Star):
                     # 聊天里已道过晚安：不重复晚安，改发"去睡了"收尾话（换模板不跳过）
                     logger.info(f"[主动私聊] {kind} -> {qq}: 已道过晚安，改发收尾话")
                     use_tpl = self.tpl_night2
+                elif kind == "morning":
+                    # 防重复：这个用户在她醒后已先开口（晨间冲刷已带出晨间演出），
+                    # 再主动问好=第二次报到，跳过这个目标
+                    wake_ts = float((self._sleep_state() or {}).get("wake_at") or 0)
+                    if wake_ts and await self._user_spoke_after(umo, wake_ts):
+                        logger.info(f"[主动私聊] {kind} -> {qq}: 用户已先开口，跳过（冲刷已带出晨间内容）")
+                        sent_any = True
+                        continue
                 text = await self._gen(use_tpl, umo)  # 按目标逐个生成（上下文各不同）
                 try:
                     await self._send_human(umo, text)
@@ -545,6 +553,38 @@ class DafeiyuDmPlugin(Star):
                     if "晚安" in self._record_text(rec.get("content", "")):
                         return True
                     break  # 只看最后一条她的话：道别后若又聊开了，晚安场景已翻篇
+            return False
+        except Exception:
+            return False
+
+    async def _user_spoke_after(self, umo: str, ts: float) -> bool:
+        """该会话用户在她醒来(ts)之后是否已发过消息——用于晨起问候防重复
+        （用户先开口=晨间冲刷已发生，她已在对话里报过到）。
+        时间从最后一条 user 记录内嵌的时间戳解析（chat_plus 存档格式
+        "[YYYY-MM-DD 周X HH:MM:SS]"），解析不到就当没说过（不误伤正常发送）。"""
+        try:
+            cm = self.context.conversation_manager
+            cid = await cm.get_curr_conversation_id(umo)
+            if not cid:
+                return False
+            conv = await cm.get_conversation(umo, cid)
+            history = getattr(conv, "history", None)
+            if isinstance(history, str):
+                history = json.loads(history)
+            if not isinstance(history, list):
+                return False
+            for rec in reversed(history):
+                if not (isinstance(rec, dict) and rec.get("role") == "user"):
+                    continue
+                txt = self._record_text(rec.get("content", ""))
+                mm = re.search(r"(\d{4})-(\d{2})-(\d{2})[^\d]{1,4}(\d{2}):(\d{2}):(\d{2})", txt)
+                if not mm:
+                    return False
+                spoke = datetime(
+                    int(mm.group(1)), int(mm.group(2)), int(mm.group(3)),
+                    int(mm.group(4)), int(mm.group(5)), int(mm.group(6)),
+                ).timestamp()
+                return spoke > ts
             return False
         except Exception:
             return False
