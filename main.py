@@ -29,7 +29,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.3.4"
+PLUGIN_VERSION = "1.3.5"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -904,20 +904,22 @@ class DafeiyuDmPlugin(Star):
             "配置：面板 → 主动私聊 → 触发 → 对应白名单（留空=全部）"
         )
 
+        # QQ 客户端会折叠空行——分隔用真实字符的分隔线，怎么折叠都看得见
+        SEP = "\n————————————\n"
         MAX_LEN = 1600
         chunks, cur = [], "🧰 主动私聊 · 可用工具\n"
         for b in blocks:
-            add = ("\n\n" if len(cur) > len("🧰 主动私聊 · 可用工具\n") else "") + b
+            add = (SEP if len(cur) > len("🧰 主动私聊 · 可用工具\n") else "") + b
             if len(cur) + len(add) > MAX_LEN:
                 chunks.append(cur)
                 cur = "🧰 主动私聊 · 可用工具（续）\n" + b
             else:
                 cur += add
-        if len(cur) + 2 + len(tail) > MAX_LEN:
+        if len(cur) + len(SEP) + len(tail) > MAX_LEN:
             chunks.append(cur)
             chunks.append(tail)
         else:
-            chunks.append(cur + "\n\n" + tail)
+            chunks.append(cur + SEP + tail)
         for c in chunks:
             yield event.plain_result(c)
 
