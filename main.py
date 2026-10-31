@@ -31,7 +31,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.5.1"
+PLUGIN_VERSION = "1.5.2"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -139,6 +139,7 @@ DEFAULTS = {
     "miss_free_cooldown_days": 1,     # 空闲档日期窗口（次日满血）
     "miss_afk_words": ["吃饭", "干饭", "洗澡", "洗漱", "出门", "取快递", "上课", "上班", "下班", "加班", "打游戏"],
     "miss_promise_words": ["晚点找你", "等会找你", "等会儿找你", "待会找你", "待会聊", "晚上找你", "晚上聊", "回头找你", "回来找你"],
+    "miss_night_words": ["晚安", "睡了", "先睡", "去睡", "睡觉啦", "睡觉了", "睡啦"],  # 你先道别→她躺下必收尾（不因她睡晚漏掉）
     "miss_mute_words": ["别发了", "别找我", "别烦我", "烦不烦", "让我静静"],
     "miss_mute_days": 3,              # 显式抑制持续天数（或主动开话2次解冻）
     "miss_jitter": "10-40",           # 抖动期"低-高"（分钟），可 0-0
@@ -306,6 +307,7 @@ class DafeiyuDmPlugin(Star):
         self.c_free_cd = min(7, max(1, int(g("miss_free_cooldown_days") or 1)))
         self.c_afk_words = [str(w).strip() for w in (g("miss_afk_words") or []) if str(w).strip()]
         self.c_promise_words = [str(w).strip() for w in (g("miss_promise_words") or []) if str(w).strip()]
+        self.c_night_words = [str(w).strip() for w in (g("miss_night_words") or []) if str(w).strip()]
         self.c_mute_words = [str(w).strip() for w in (g("miss_mute_words") or []) if str(w).strip()]
         self.c_mute_days = min(30, max(1, int(g("miss_mute_days") or 3)))
         self.c_jitter_lo, self.c_jitter_hi = self._parse_jitter(g("miss_jitter"))
@@ -651,6 +653,10 @@ class DafeiyuDmPlugin(Star):
                 hit = next((w for w in self.c_promise_words if w in text), None)
                 if hit:
                     s["promise"] = {"word": hit, "event": now}
+            # 你先道了别：记下时刻（20点后算数，防白天误伤）——她睡得再晚，躺下也必收尾
+            if self.c_night_words and datetime.fromtimestamp(now).hour >= 20:
+                if any(w in text for w in self.c_night_words):
+                    s["goodnight_ts"] = now
             # 存稿：睡眠期来言（自己的记录，不依赖 sleep 缓冲内部结构）
             if self._sleep_phase() == "sleeping":
                 s["night_in"][datetime.now().date().isoformat()] = True
@@ -1129,6 +1135,12 @@ class DafeiyuDmPlugin(Star):
         umo = f"{pid}:FriendMessage:{qq}"
         s = self._sess(umo)
         chatted = len([t for t in (s.get("msg_times") or []) if bed_ts - 2 * 3600 <= t <= now]) > 0
+        # 你先道过别（同晚8小时内）→ 即使在她睡前2小时窗口外，躺下也必收尾：
+        # 道别是对等的，不该因为她自己睡晚了就漏掉你说的晚安
+        gn = float(s.get("goodnight_ts") or 0)
+        said_bye = bed_ts - 8 * 3600 <= gn <= now
+        if said_bye:
+            chatted = True
         already = await self._already_said_goodnight(umo)
         anchor = int(self._st.get("evening_skip", 0)) >= 2
         if not n.get("rolled"):
@@ -1137,7 +1149,7 @@ class DafeiyuDmPlugin(Star):
             n["rolled"] = True
             n["p"] = round(p, 3)
             n["win"] = chatted or anchor or (random.random() < p)
-            self._dlog({"t": "night_roll", "p": round(p, 3), "chatted": chatted,
+            self._dlog({"t": "night_roll", "p": round(p, 3), "chatted": chatted, "said_bye": said_bye,
                         "owl_f": owl_f, "anchor": anchor, "win": n["win"]})
         if n.get("win"):
             tpl = self.tpl_night2 if already else self.tpl_night
