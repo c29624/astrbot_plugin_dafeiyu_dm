@@ -201,7 +201,7 @@ def _clamp_lo_hi(lo: int, hi: int) -> tuple:
 
 @register(
     PLUGIN_NAME,
-    "29624",
+    "c29624",
     "主动私聊：晨起/睡前/随机想念，联动睡觉插件作息，她睡着不打扰；可挂任意llm工具",
     PLUGIN_VERSION,
 )
