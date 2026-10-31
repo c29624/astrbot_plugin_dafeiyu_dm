@@ -29,7 +29,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.3.1"
+PLUGIN_VERSION = "1.3.2"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -837,7 +837,7 @@ class DafeiyuDmPlugin(Star):
 
     @filter.command("主动私聊工具")
     async def cmd_tools(self, event: AstrMessageEvent):
-        """列出当前所有可用的 llm_tool（所属插件·工具名·说明），
+        """列出当前所有可用的 llm_tool（按插件分组·名字·说明），
         供配置三路白名单时照抄——解决"用户不知道工具叫什么"的问题"""
         if not self._is_admin(event):
             yield event.plain_result("没权限")
@@ -848,33 +848,46 @@ class DafeiyuDmPlugin(Star):
         except Exception:
             yield event.plain_result("工具管理器不可用，看日志")
             return
-        lines = []
+        # 按插件分组（手机上无等宽字体，分组小标题比一行塞插件名可读）
+        groups: dict = {}
         for t in tools:
             name = getattr(t, "name", "?")
-            desc = (getattr(t, "description", "") or "").strip().split("\n")[0][:40]
+            desc = (getattr(t, "description", "") or "").strip().split("\n")[0][:36]
             if not desc:
                 desc = "（无描述）"
-            plugin = ""
+            plugin = "其他"
             mod = getattr(t, "handler_module_path", None)
             if mod:
                 try:
                     from astrbot.core.star.star_handler import star_map
 
                     p = star_map.get(mod)
-                    plugin = (getattr(p, "display_name", None) or getattr(p, "name", "") or "") + " · "
+                    plugin = getattr(p, "display_name", None) or getattr(p, "name", "") or "其他"
                 except Exception:
                     pass
             state = "" if getattr(t, "active", True) else "（已禁用）"
-            lines.append(f"· {plugin}{name} — {desc}{state}")
-        if not lines:
-            lines = ["（当前没有任何已注册的工具）"]
+            groups.setdefault(plugin, []).append(f"· {name} — {desc}{state}")
+        if not groups:
+            groups = {"（当前没有任何已注册的工具）": []}
+        body = "\n".join(
+            (f"【{g}】\n" + "\n".join(ts)) if ts else f"【{g}】" for g, ts in groups.items()
+        )
+
+        def _line(label, on, names):
+            lst = f"：{'、'.join(names)}" if names else "：空 = 全部工具"
+            return f"· {label}（{'开' if on else '关'}）{lst}"
+
         yield event.plain_result(
-            "[主动私聊] 可用工具（所属插件 · 工具名 — 说明）：\n"
-            + "\n".join(lines)
-            + f"\n\n当前白名单：晨起={'开' if self.c_tools_morning_on else '关'}{self.c_tools_morning_names or '(空=全部)'}"
-            f" 睡前={'开' if self.c_tools_night_on else '关'}{self.c_tools_night_names or '(空=全部)'}"
-            f" 随机={'开' if self.c_tools_random_on else '关'}{self.c_tools_random_names or '(空=全部)'}\n"
-            "把工具名填进面板→主动私聊→触发→对应白名单即可（留空=全部）"
+            "🧰 主动私聊 · 可用工具\n"
+            f"{body}\n\n"
+            "📋 当前白名单\n"
+            + _line("晨起", self.c_tools_morning_on, self.c_tools_morning_names)
+            + "\n"
+            + _line("睡前", self.c_tools_night_on, self.c_tools_night_names)
+            + "\n"
+            + _line("随机", self.c_tools_random_on, self.c_tools_random_names)
+            + "\n\n"
+            "配置：面板 → 主动私聊 → 触发 → 对应白名单（留空=全部）"
         )
 
     @filter.command("主动私聊测试")
