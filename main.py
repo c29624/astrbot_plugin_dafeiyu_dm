@@ -31,7 +31,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.6.0"
+PLUGIN_VERSION = "1.6.1"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -145,7 +145,7 @@ DEFAULTS = {
     "miss_mute_words": ["别发了", "别找我", "别烦我", "烦不烦", "让我静静"],
     "miss_mute_days": 3,              # 显式抑制持续天数（或主动开话2次解冻）
     "miss_retry_gap": "3-6",         # 长冷场重想间隔（小时"低-高"，每次单独抽）
-    "miss_retry_decay": 0.7,         # 重想概率衰减：第k次=第一次×decay^(k-1)（最强烈的是第一次）
+    "miss_retry_tau": 5,              # 想念半衰期（小时）：重想概率=U0/(1+t/τ)双曲衰减，τ随热度伸缩
     "miss_jitter": "10-40",           # 抖动期"低-高"（分钟），可 0-0
     "miss_drift": True,               # 每日参数微扰 ±20%
     "miss_quiet_mode": "auto",        # auto=跟睡眠作息 / manual=用手动时段
@@ -181,25 +181,25 @@ _TEMPERAMENTS = {
     "平淡": {"morning_base": 0.5, "evening_base": 0.35, "ov": {
         "c_base_p": 0.35, "c_cd_days": 3, "c_daily_max": 1, "c_cap": 3, "c_random_n": 1,
         "c_reply_slow_f": 0.70, "c_reply_none_f": 0.50, "c_floor": 0.15,
-        "c_retry_gap_lo": 6.0, "c_retry_gap_hi": 12.0, "c_retry_decay": 0.50,
+        "c_retry_gap_lo": 6.0, "c_retry_gap_hi": 12.0, "c_retry_tau": 2.0,
         "c_heat_cold_f": 0.50, "c_heat_hot_f": 1.10,
         "c_afk_min": 60, "c_mid_min": 120, "c_silence_min": 180, "c_gap": 3.0}},
     "正常": {"morning_base": 0.7, "evening_base": 0.5, "ov": {
         "c_base_p": 0.6, "c_cd_days": 2, "c_daily_max": 1, "c_cap": 4, "c_random_n": 2,
         "c_reply_slow_f": 0.85, "c_reply_none_f": 0.70, "c_floor": 0.30,
-        "c_retry_gap_lo": 3.0, "c_retry_gap_hi": 6.0, "c_retry_decay": 0.70,
+        "c_retry_gap_lo": 3.0, "c_retry_gap_hi": 6.0, "c_retry_tau": 5.0,
         "c_heat_cold_f": 0.70, "c_heat_hot_f": 1.25,
         "c_afk_min": 45, "c_mid_min": 90, "c_silence_min": 120, "c_gap": 2.0}},
     "热情": {"morning_base": 0.85, "evening_base": 0.65, "ov": {
         "c_base_p": 0.75, "c_cd_days": 1, "c_daily_max": 2, "c_cap": 5, "c_random_n": 3,
         "c_reply_slow_f": 0.95, "c_reply_none_f": 0.85, "c_floor": 0.40,
-        "c_retry_gap_lo": 2.0, "c_retry_gap_hi": 4.0, "c_retry_decay": 0.85,
+        "c_retry_gap_lo": 2.0, "c_retry_gap_hi": 4.0, "c_retry_tau": 8.0,
         "c_heat_cold_f": 0.85, "c_heat_hot_f": 1.45,
         "c_afk_min": 35, "c_mid_min": 75, "c_silence_min": 90, "c_gap": 1.0}},
     "病娇": {"morning_base": 0.95, "evening_base": 0.8, "ov": {
         "c_base_p": 0.90, "c_cd_days": 1, "c_daily_max": 4, "c_cap": 7, "c_random_n": 5,
         "c_reply_slow_f": 1.00, "c_reply_none_f": 1.00, "c_floor": 0.55,
-        "c_retry_gap_lo": 1.0, "c_retry_gap_hi": 2.0, "c_retry_decay": 0.95,
+        "c_retry_gap_lo": 1.0, "c_retry_gap_hi": 2.0, "c_retry_tau": 12.0,
         "c_heat_cold_f": 1.00, "c_heat_hot_f": 1.70,
         "c_afk_min": 25, "c_mid_min": 50, "c_silence_min": 60, "c_gap": 0.5}},
     "自定义": {"morning_base": 0.7, "evening_base": 0.5, "ov": {}},
@@ -352,7 +352,7 @@ class DafeiyuDmPlugin(Star):
         self.c_retry_gap_hi = min(12.0, max(1.0, float(rg_hi)))
         if self.c_retry_gap_hi < self.c_retry_gap_lo:
             self.c_retry_gap_lo, self.c_retry_gap_hi = self.c_retry_gap_hi, self.c_retry_gap_lo
-        self.c_retry_decay = min(0.95, max(0.3, float(g("miss_retry_decay") or 0.7)))
+        self.c_retry_tau = min(12.0, max(1.0, float(g("miss_retry_tau") or 5)))
         self.c_drift = bool(g("miss_drift"))
         self.c_quiet_mode = str(g("miss_quiet_mode") or "auto").strip().lower()
         if self.c_quiet_mode not in ("auto", "manual"):
@@ -1378,11 +1378,6 @@ class DafeiyuDmPlugin(Star):
                     continue
                 attempt = int(d.get("n") or 1) + 1
             p, factors = self._miss_probability(umo, tier, rounds)
-            if attempt > 1:
-                # 重想概率衰减：最强烈的是第一次，忍过去就淡了
-                p = p * (self.c_retry_decay ** (attempt - 1))
-                factors = dict(factors)
-                factors["retry"] = attempt
             if attempt == 1:
                 # 本事件总次数随热度抽（聊得越热她想起你的次数越多；抽的，观察不出固定数）
                 if rounds >= self.c_heat_hot_min:
@@ -1391,9 +1386,28 @@ class DafeiyuDmPlugin(Star):
                     max_n = 1
                 else:
                     max_n = random.randint(1, 2)
+                # 想念半衰期随热度伸缩（v1.6.1，池内随机抽防可数）：聊得越热念想褪得越慢
+                if rounds >= self.c_heat_hot_min:
+                    hm = random.uniform(1.3, 1.6)
+                elif rounds <= self.c_heat_cold_max:
+                    hm = random.uniform(0.6, 0.8)
+                else:
+                    hm = random.uniform(0.9, 1.1)
+                tau_eff = self.c_retry_tau * hm
+                t0 = now
             else:
                 max_n = int(d.get("max_n") or 1)
+                tau_eff = float(d.get("tau") or self.c_retry_tau)
+                t0 = float(d.get("t0") or now)
+                # 重想衰减：双曲想念曲线 U=U0/(1+t/τ)——前快后慢带长尾（Mazur 双曲贴现在人头对头
+                # 比较里赢指数模型；ACT-R："还会被想起"的概率随时间幂律下降）。τ 第一次掷时就抽好。
+                t_h = max(0.0, (now - t0) / 3600.0)
+                f_retry = 1.0 / (1.0 + t_h / tau_eff)
+                p = p * f_retry
+                factors = dict(factors)
+                factors["retry"] = round(f_retry, 3)
             s["dice"] = {"event": ev, "rolled": True, "n": attempt, "max_n": max_n,
+                         "t0": t0, "tau": round(tau_eff, 3),
                          "wobble": self._event_wobble(umo, ev), "p": round(p, 3),
                          "factors": factors, "tier": tier,
                          "next_at": (now + random.uniform(self.c_retry_gap_lo, self.c_retry_gap_hi) * 3600)
