@@ -32,7 +32,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.7.0"
+PLUGIN_VERSION = "1.7.1"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -2273,6 +2273,54 @@ class DafeiyuDmPlugin(Star):
             f"台账：内心{led.get('inner', 0)} 生成{led.get('gen', 0)}"
             f" 工具{led.get('tools', 0)} 被否决{led.get('vetoed', 0)} 废稿{led.get('void_gen', 0)}"
         )
+        yield event.plain_result("\n".join(lines))
+
+    def _miss_day_stats(self, qq: str) -> dict:
+        """某人今天的想念台账：从 dlog 按当日过滤（ts 是 MM-DD HH:MM）。
+        想起=掷骰次数（含没中和中签）；忍住=没中+终检拦下+她自己拦下"""
+        today = datetime.now().strftime("%m-%d")
+        st = {"rolls": 0, "win": 0, "lose": 0, "void": 0, "veto": 0, "sent": 0}
+        for e in (self._st.get("dlog") or []):
+            if str(e.get("umo") or "") != str(qq) or not str(e.get("ts") or "").startswith(today):
+                continue
+            t = e.get("t")
+            if t == "miss_lose":
+                st["rolls"] += 1
+                st["lose"] += 1
+            elif t == "miss_win":
+                st["rolls"] += 1
+                st["win"] += 1
+            elif t == "miss_void":
+                st["void"] += 1
+            elif t == "miss_veto":
+                st["veto"] += 1
+            elif t == "miss_sent":
+                st["sent"] += 1
+        return st
+
+    @filter.command("主动私聊想你")
+    async def cmd_miss_count(self, event: AstrMessageEvent):
+        """今天的想念台账：想起几次、来了几次、忍住几次（忍住的原因也拆开）"""
+        if not self._is_admin(event):
+            yield event.plain_result("没权限")
+            return
+        lines = [f"[主动私聊] {datetime.now().strftime('%m-%d')} 想你台账"]
+        for pid, qqs in (self._target_map() or {}).items():
+            for qq in qqs:
+                st = self._miss_day_stats(qq)
+                if not any(st.values()):
+                    lines.append(f"· {qq}：今天还没想起过你")
+                    continue
+                held = st["lose"] + st["void"] + st["veto"]
+                why = []
+                if st["lose"]:
+                    why.append(f"没中{st['lose']}")
+                if st["void"]:
+                    why.append(f"终检拦下{st['void']}")
+                if st["veto"]:
+                    why.append(f"她自己拦下{st['veto']}")
+                lines.append(f"· {qq}：想起 {st['rolls']} 次 → 来了 {st['sent']} 次，"
+                             f"忍住 {held} 次（{'·'.join(why)}）")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("主动私聊工具")
