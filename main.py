@@ -32,7 +32,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.7.2"
+PLUGIN_VERSION = "1.7.3"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -169,10 +169,11 @@ DEFAULTS = {
         "内容与语气按你们的相处和最近聊天的氛围自己定。别提系统。"
     ),
     "dm_miss_veto_hint": (
-        "在组织表达之前，先判断：此刻主动找{who}合适吗？（对方刚说了在忙/刚吵完架/"
-        "话说得好好的突然来一句=不合适；冷场很久了/有话可接=合适。）"
-        "如果判断是【不合适】，第一行只写【不发】加一句理由，后面不用写任何要发的内容；"
-        "合适就第一行写【发】，然后正常组织。"
+        "发之前先自问一句：从最近聊天的内容看，这会儿主动找{who}合不合时宜——"
+        "TA刚说过在忙/在赶工/心情很差、或你们刚闹了不愉快，就别凑上去："
+        "第一行只写【不发】加一句理由，后面什么都不要写。"
+        "其他情况第一行写【发】，然后接着写要说的话。"
+        "拿不准就【发】——时机系统已经把过关，你只看内容和氛围。"
     ),
 }
 
