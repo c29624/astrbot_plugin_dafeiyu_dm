@@ -32,7 +32,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.7.1"
+PLUGIN_VERSION = "1.7.2"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -113,9 +113,10 @@ DEFAULTS = {
     "miss_silence_min": 120,          # 普通档阈值（分钟）
     "miss_mid_min": 90,               # 中档：约定未赴 / 聊嗨断线
     "miss_afk_min": 45,               # 吃饭档：离席词命中
-    "miss_temperament": "自定义",      # 平淡/正常/热情/病娇/自定义：懒人挡位一键接管数值
+    "miss_temperament": "自定义",      # 平淡/正常/热情/病娇/自定义/自定义槽名：懒人挡位一键接管数值
     "miss_tier_per_conf": False,       # 挡位按配置文件/QQ区分（v1.7.0）
     "miss_tier_conf_map": [],          # "配置ID前缀=挡位" / "QQ=挡位" / "default=挡位"
+    "miss_custom_slots": [],           # 自定义挡位槽（v1.7.2，最多3个）："名称: 参数=值, 参数=值…"
     "miss_base_p": 0.6,
     "miss_cooldown_days": 2,          # 日期档回血窗口（天）
     "miss_daily_max": 1,              # 想你每日上限（1~5）
@@ -209,6 +210,24 @@ _TEMPERAMENTS = {
 }
 # 旧挡位名迁移：淡泊/黏人是用户主动选过的性格→映射新名保留意图；标准是旧默认→转自定义，保住手动调过的数值
 _TEMPERAMENT_MIGRATE = {"淡泊": "平淡", "标准": "自定义", "黏人": "热情"}
+# 自定义挡位槽可写的参数键 → (c_属性/None=基线, 下限, 上限, 类型)；值按同款夹取范围收口
+_CUSTOM_KEYS = {
+    "miss_base_p": ("c_base_p", 0.05, 1.0, float),
+    "miss_cooldown_days": ("c_cd_days", 1, 7, int),
+    "miss_daily_max": ("c_daily_max", 1, 5, int),
+    "dm_daily_cap": ("c_cap", 1, 7, int),
+    "miss_reply_slow_factor": ("c_reply_slow_f", 0.1, 1.0, float),
+    "miss_reply_none_factor": ("c_reply_none_f", 0.1, 1.0, float),
+    "miss_floor": ("c_floor", 0.05, 0.9, float),
+    "miss_retry_tau": ("c_retry_tau", 1.0, 12.0, float),
+    "miss_heat_cold_factor": ("c_heat_cold_f", 0.1, 2.0, float),
+    "miss_heat_hot_factor": ("c_heat_hot_f", 1.0, 2.0, float),
+    "miss_afk_min": ("c_afk_min", 10, 120, int),
+    "miss_mid_min": ("c_mid_min", 15, 240, int),
+    "miss_silence_min": ("c_silence_min", 20, 480, int),
+    "morning_base": (None, 0.05, 1.0, float),
+    "evening_base": (None, 0.05, 1.0, float),
+}
 _WEEKDAY_NAMES = {"周一": 0, "周二": 1, "周三": 2, "周四": 3, "周五": 4, "周六": 5, "周日": 6}
 
 
@@ -306,10 +325,55 @@ class DafeiyuDmPlugin(Star):
         if (self.c_afk_min, self.c_mid_min, self.c_silence_min) != (afk, mid, sil):
             logger.info(f"[主动私聊] 三档阈值配乱序({afk}/{mid}/{sil})，已自动排序为 "
                         f"{self.c_afk_min}/{self.c_mid_min}/{self.c_silence_min}")
+        # v1.7.2 自定义挡位槽：最多3个命名参数包，槽名可当挡位用在全局选择和映射表里
+        self._custom_tiers = {}
+        for _slot in list(g("miss_custom_slots") or [])[:3]:
+            _line = str(_slot).strip()
+            _name, _sep, _body = _line.partition(":")
+            if not _sep:
+                _name, _sep, _body = _line.partition("：")
+            _name = _name.strip()
+            if not _name or _name in _TEMPERAMENTS or _name in self._custom_tiers:
+                logger.warning(f"[主动私聊] 自定义挡位槽「{_line[:30]}」名字为空/与固定挡重名/重复，跳过")
+                continue
+            _ov, _m, _e = {}, None, None
+            for _kv in _body.split(","):
+                _k, _s2, _v = _kv.partition("=")
+                _k, _v = _k.strip(), _v.strip()
+                if _k == "miss_retry_gap" and _s2:
+                    _lo, _hi = self._parse_jitter(_v or "3-6")
+                    _ov["c_retry_gap_lo"] = min(12.0, max(1.0, float(_lo)))
+                    _ov["c_retry_gap_hi"] = min(12.0, max(1.0, float(_hi)))
+                    continue
+                _spec = _CUSTOM_KEYS.get(_k)
+                if not _spec or not _s2:
+                    logger.warning(f"[主动私聊] 自定义挡位槽「{_name}」参数「{_k}」不认识，跳过")
+                    continue
+                _attr, _lo, _hi, _cast = _spec
+                try:
+                    _val = _cast(float(_v))
+                except ValueError:
+                    logger.warning(f"[主动私聊] 自定义挡位槽「{_name}」参数「{_k}={_v}」不是数，跳过")
+                    continue
+                _val = min(_hi, max(_lo, _val))
+                if _attr is None:
+                    if _k == "morning_base":
+                        _m = _val
+                    else:
+                        _e = _val
+                else:
+                    _ov[_attr] = _val
+            self._custom_tiers[_name] = {
+                "morning_base": 0.7 if _m is None else _m,
+                "evening_base": 0.5 if _e is None else _e,
+                "ov": _ov,
+            }
+            if _ov or _m is not None or _e is not None:
+                logger.info(f"[主动私聊] 自定义挡位槽「{_name}」已注册（{len(_ov)} 项参数）")
         temper_raw = str(g("miss_temperament") or "自定义")
         temper = _TEMPERAMENT_MIGRATE.get(temper_raw, temper_raw)  # 旧名迁移（淡泊/标准/黏人）
-        self.c_temperament = temper if temper in _TEMPERAMENTS else "自定义"
-        tp = _TEMPERAMENTS[self.c_temperament]
+        self.c_temperament = temper if (temper in _TEMPERAMENTS or temper in self._custom_tiers) else "自定义"
+        tp = self._tier_def(self.c_temperament)
         self.c_base_p = min(1.0, max(0.05, float(g("miss_base_p") or DEFAULTS["miss_base_p"])))
         self.c_morning_base = tp["morning_base"]
         self.c_evening_base = tp["evening_base"]
@@ -392,7 +456,7 @@ class DafeiyuDmPlugin(Star):
                 continue
             _k, _, _v = _s.partition("=")
             _k, _v = _k.strip(), str(_TEMPERAMENT_MIGRATE.get(_v.strip(), _v.strip()))
-            if _v not in _TEMPERAMENTS:
+            if _v not in _TEMPERAMENTS and _v not in self._custom_tiers:
                 logger.warning(f"[主动私聊] 挡位映射「{_s}」挡位名不认识，跳过")
                 continue
             self._tier_map[("qq:" + _k) if _k.isdigit() else ("conf:" + _k.lower())] = _v
@@ -444,6 +508,10 @@ class DafeiyuDmPlugin(Star):
             setattr(ns, k, getattr(self, "c_" + k))
         return ns
 
+    def _tier_def(self, name: str) -> dict:
+        """挡位定义：固定挡或自定义槽；都不认识回落自定义（不动数值）"""
+        return _TEMPERAMENTS.get(name) or self._custom_tiers.get(name) or _TEMPERAMENTS["自定义"]
+
     def _P(self, umo: str):
         """该 umo 的有效参数：开关关=全局快照；开=按 QQ/配置文件解析挡位后叠加 ov"""
         if not self.c_tier_per_conf:
@@ -452,7 +520,7 @@ class DafeiyuDmPlugin(Star):
         cached = self._p_cache.get(umo)
         if cached and cached[0] == tier:
             return cached[1]
-        tp = _TEMPERAMENTS[tier]
+        tp = self._tier_def(tier)
         ns = SimpleNamespace()
         for k in self._P_KEYS:
             setattr(ns, k, getattr(self._p_global, k))

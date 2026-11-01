@@ -26,7 +26,13 @@
       },
       "miss_tier_conf_map": {
         "description": "挡位映射表（配置文件/QQ=挡位）",
-        "hint": "每项一条，三种写法：配置ID前缀=挡位（如 c68d22da=热情，默认配置写 default=平淡，配置ID就是面板配置管理里那串的开头）；QQ=挡位（如 10001=病娇，优先级最高）；没写到的用全局挡位。挡位名同上（平淡/正常/热情/病娇/自定义）",
+        "hint": "每项一条，三种写法：配置ID前缀=挡位（如 c68d22da=热情，默认配置写 default=平淡，配置ID就是面板配置管理里那串的开头）；QQ=挡位（如 10001=病娇，优先级最高）；没写到的用全局挡位。挡位名可用固定挡（平淡/正常/热情/病娇/自定义）或下面配的自定义槽名",
+        "type": "list",
+        "default": []
+      },
+      "miss_custom_slots": {
+        "description": "自定义挡位槽（最多3个）",
+        "hint": "想给某人单独配一套数值又不想用固定挡：每项一行「槽名: 参数=值, 参数=值…」（槽名随意，别和固定挡重名，多的忽略）。可用参数：miss_base_p基础概率 / miss_cooldown_days冷却天数 / miss_daily_max想你上限 / dm_daily_cap每日总量 / miss_reply_slow_factor慢回折扣 / miss_reply_none_factor没回折扣 / miss_floor概率下限 / miss_retry_gap重想间隔(如3-6) / miss_retry_tau想念半衰期 / miss_heat_cold_factor冷场折扣 / miss_heat_hot_factor聊嗨上浮 / miss_afk_min吃饭档阈值 / miss_mid_min中档阈值 / miss_silence_min普通档阈值 / morning_base晨起基线 / evening_base睡前基线。没写的参数用全局值，数值自动夹进合法范围。例：小博专属: miss_base_p=0.8, miss_daily_max=2, miss_retry_tau=8。配好后在映射表写 10001=小博专属 即可；全局挡位选择填槽名也认",
         "type": "list",
         "default": []
       },
