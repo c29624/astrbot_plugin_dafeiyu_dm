@@ -31,7 +31,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.5.9"
+PLUGIN_VERSION = "1.5.10"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -144,6 +144,8 @@ DEFAULTS = {
     "miss_together_min": 150,          # 在一起语境持续分钟（10~480 夹取）
     "miss_mute_words": ["别发了", "别找我", "别烦我", "烦不烦", "让我静静"],
     "miss_mute_days": 3,              # 显式抑制持续天数（或主动开话2次解冻）
+    "miss_retry_gap": "3-6",         # 长冷场重想间隔（小时"低-高"，每次单独抽）
+    "miss_retry_decay": 0.7,         # 重想概率衰减：第k次=第一次×decay^(k-1)（最强烈的是第一次）
     "miss_jitter": "10-40",           # 抖动期"低-高"（分钟），可 0-0
     "miss_drift": True,               # 每日参数微扰 ±20%
     "miss_quiet_mode": "auto",        # auto=跟睡眠作息 / manual=用手动时段
@@ -316,6 +318,12 @@ class DafeiyuDmPlugin(Star):
         self.c_mute_words = [str(w).strip() for w in (g("miss_mute_words") or []) if str(w).strip()]
         self.c_mute_days = min(30, max(1, int(g("miss_mute_days") or 3)))
         self.c_jitter_lo, self.c_jitter_hi = self._parse_jitter(g("miss_jitter"))
+        rg_lo, rg_hi = self._parse_jitter(g("miss_retry_gap") or "3-6")  # 重想间隔（小时，复用低-高解析）
+        self.c_retry_gap_lo = min(12.0, max(1.0, float(rg_lo)))
+        self.c_retry_gap_hi = min(12.0, max(1.0, float(rg_hi)))
+        if self.c_retry_gap_hi < self.c_retry_gap_lo:
+            self.c_retry_gap_lo, self.c_retry_gap_hi = self.c_retry_gap_hi, self.c_retry_gap_lo
+        self.c_retry_decay = min(0.95, max(0.3, float(g("miss_retry_decay") or 0.7)))
         self.c_drift = bool(g("miss_drift"))
         self.c_quiet_mode = str(g("miss_quiet_mode") or "auto").strip().lower()
         if self.c_quiet_mode not in ("auto", "manual"):
@@ -896,6 +904,13 @@ class DafeiyuDmPlugin(Star):
 
     # ---------- v1.5 决策日志与 token 台账 ----------
 
+    def _dice_done(self, umo: str):
+        """终结本静默事件的骰子（中签/否决/作废后不再重想）"""
+        d = self._sess(umo).get("dice")
+        if d:
+            d["done"] = True
+            d["next_at"] = 0.0
+
     def _dlog(self, entry: dict):
         entry["ts"] = datetime.now().strftime("%m-%d %H:%M")
         log = self._st.setdefault("dlog", [])
@@ -1292,6 +1307,7 @@ class DafeiyuDmPlugin(Star):
                 else:
                     self._dlog({"t": "miss_void", "why": why, "umo": qq})
                     s["pending"] = None
+                    self._dice_done(umo)  # 作废即终结，不再重想
                 continue
             if pend:
                 continue  # 还没到抖动时刻
@@ -1318,19 +1334,45 @@ class DafeiyuDmPlugin(Star):
             if silence < thr:
                 continue
             d = s.get("dice")
+            attempt = 1
             if d and float(d.get("event") or 0) == ev and d.get("rolled"):
-                continue  # 本事件已掷过
+                # v1.5.10 长冷场重想：次数没耗尽且到点才衰减重掷；中签/否决/作废一次即终结
+                if d.get("done") or int(d.get("n") or 1) >= int(d.get("max_n") or 1):
+                    continue
+                if now < float(d.get("next_at") or 0):
+                    continue
+                attempt = int(d.get("n") or 1) + 1
             p, factors = self._miss_probability(umo, tier, rounds)
-            s["dice"] = {"event": ev, "rolled": True, "wobble": self._event_wobble(umo, ev),
-                         "p": round(p, 3), "factors": factors, "tier": tier}
+            if attempt > 1:
+                # 重想概率衰减：最强烈的是第一次，忍过去就淡了
+                p = p * (self.c_retry_decay ** (attempt - 1))
+                factors = dict(factors)
+                factors["retry"] = attempt
+            if attempt == 1:
+                # 本事件总次数随热度抽（聊得越热她想起你的次数越多；抽的，观察不出固定数）
+                if rounds >= self.c_heat_hot_min:
+                    max_n = random.randint(2, 3)
+                elif rounds <= self.c_heat_cold_max:
+                    max_n = 1
+                else:
+                    max_n = random.randint(1, 2)
+            else:
+                max_n = int(d.get("max_n") or 1)
+            s["dice"] = {"event": ev, "rolled": True, "n": attempt, "max_n": max_n,
+                         "wobble": self._event_wobble(umo, ev), "p": round(p, 3),
+                         "factors": factors, "tier": tier,
+                         "next_at": (now + random.uniform(self.c_retry_gap_lo, self.c_retry_gap_hi) * 3600)
+                         if attempt < max_n else 0.0}
             if random.random() < p:
                 lo, hi = self.c_jitter_lo, self.c_jitter_hi
                 s["pending"] = {"event": ev, "at": now + random.uniform(lo, hi) * 60}
+                self._dice_done(umo)
                 self._dlog({"t": "miss_win", "umo": qq, "tier": tier, "p": round(p, 3),
-                            "rounds": rounds, "factors": factors,
+                            "rounds": rounds, "factors": factors, "n": attempt,
                             "at": datetime.fromtimestamp(s["pending"]["at"]).strftime("%H:%M")})
             else:
-                self._dlog({"t": "miss_lose", "umo": qq, "tier": tier, "p": round(p, 3), "rounds": rounds})
+                self._dlog({"t": "miss_lose", "umo": qq, "tier": tier, "p": round(p, 3),
+                            "rounds": rounds, "n": attempt})
         self._save_state()
 
     def _pending_gates(self, umo: str, now: float, phase: str):
@@ -1375,6 +1417,7 @@ class DafeiyuDmPlugin(Star):
             self._ledger_add("vetoed")
             why = getattr(self, "_last_veto_reason", "")
             self._dlog({"t": "miss_veto", "umo": umo.split(":")[-1], "tag": tag, "why": why[:60]})
+            self._dice_done(umo)  # 否决=今日销账，不再重想
             return  # 否决：不耗每日额度，骰子已记已用
         try:
             await self._send_human(umo, text)
