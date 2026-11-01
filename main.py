@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.0.0"
+PLUGIN_VERSION = "2.1.0"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -176,12 +176,23 @@ DEFAULTS = {
         "内容与语气按你们的相处和最近聊天的氛围自己定。别提系统。"
     ),
     "dm_miss_veto_hint": (
-        "发之前先自问一句：从最近聊天的内容看，这会儿主动找{who}合不合时宜——"
+        "发之前先自问一句：从最近聊天的内容和氛围看，这会儿主动找{who}合不合时宜——"
         "TA刚说过在忙/在赶工/心情很差、或你们刚闹了不愉快，就别凑上去："
         "第一行只写【不发】加一句理由，后面什么都不要写。"
         "其他情况第一行写【发】，然后接着写要说的话。"
+        "TA暂时离席（吃饭/洗澡/出门/下班路上）不算在忙——离席多久、该不该等，"
+        "背景事实里有：离席期间发消息不会打扰，TA回来自会看到。"
         "拿不准就【发】——时机系统已经把过关，你只看内容和氛围。"
     ),
+    "dm_miss_stance_hint": (
+        "你是TA身边亲近的人，不是助理。想找TA说句话很正常，"
+        "不用替TA找「可能打扰」的理由——时机该不该，规则层已经把关。"
+        "只在你真的觉得TA此刻不方便时才按住。"
+    ),
+    "dm_miss_stance_gen": False,     # 一次性心态段生成器：开=按当前人设生成一次→写回→自动关回
+    "miss_stance_conf_map": [],      # "配置ID前缀=心态段" / "QQ=心态段" / "default=心态段"（按人分流，同挡位映射）
+    "miss_free_p_mult": 1.2,         # 空闲日基础概率乘子（周末/节假日/扣除调休）
+    "miss_free_thr_mult": 0.8,       # 空闲日触发阈值乘子（<1=更早起评）
 }
 
 # 性格预设映射（只动这四个键，其余因子不碰）
@@ -504,6 +515,28 @@ class DafeiyuDmPlugin(Star):
         self._p_global = self._build_p_global()
         self.tpl_miss_random = str(g("dm_miss_random_template") or DEFAULTS["dm_miss_random_template"])
         self.tpl_veto_hint = str(g("dm_miss_veto_hint") or DEFAULTS["dm_miss_veto_hint"])
+        # v2.1.0 AI 感官包：心态段（判断先验，按人可分）+ 周末档乘子
+        self._cfg_obj = config
+        _sv = g("dm_miss_stance_hint")
+        self.c_stance_hint = DEFAULTS["dm_miss_stance_hint"] if _sv is None else str(_sv).strip()
+        self._stance_map = {}
+        for _item in (g("miss_stance_conf_map") or []):
+            _s2 = str(_item).strip()
+            if "=" not in _s2:
+                logger.warning(f"[主动私聊] 心态段映射「{_s2}」没有=，跳过")
+                continue
+            _k2, _, _v2 = _s2.partition("=")
+            self._stance_map[("qq:" + _k2) if _k2.strip().isdigit() else ("conf:" + _k2.strip().lower())] = _v2.strip()
+        if self._stance_map:
+            logger.info(f"[主动私聊] 心态段按人分流已开（{len(self._stance_map)} 条映射，QQ/配置前缀）")
+        try:
+            self.c_free_p_mult = min(2.0, max(0.5, float(g("miss_free_p_mult"))))
+        except Exception:
+            self.c_free_p_mult = 1.2
+        try:
+            self.c_free_thr_mult = min(1.5, max(0.5, float(g("miss_free_thr_mult"))))
+        except Exception:
+            self.c_free_thr_mult = 0.8
         # 评估时段自动模式的缓存（读不到 sleep 时沿用上次推导）
         self._quiet_cache = None
         self._last_gen_status = "ok"
@@ -734,6 +767,12 @@ class DafeiyuDmPlugin(Star):
             self._data_dir.mkdir(parents=True, exist_ok=True)
         self._load_state()
         self._task = asyncio.create_task(self._tick_loop())
+        # v2.1.0 一次性心态段生成器：开关只在用户显式打开时为真（生成完自动关回）
+        try:
+            if bool(self._flatten(self._cfg_obj or {}).get("dm_miss_stance_gen")):
+                asyncio.create_task(self._stance_gen_once())
+        except Exception:
+            pass
         logger.info(
             f"[主动私聊] v{PLUGIN_VERSION} 已启动：目标={self._target_map() or '（未解析到）'} "
             f"晨起={'开' if self.c_morning else '关'} 睡前={'开' if self.c_night else '关'} "
@@ -1129,6 +1168,8 @@ class DafeiyuDmPlugin(Star):
                 "normal": drift.get("silence", P.silence_min)}[tier]
         if s.get("act_from") == "bot":  # 机器人自己发起没人回：×1.5
             base = base * 1.5
+        if self._is_free_day():  # v2.1.0 空闲日：没聊=真没聊，起评线提前
+            base = base * self.c_free_thr_mult
         return tier, float(base)
 
     def _miss_probability(self, umo: str, tier: str, rounds: int) -> tuple:
@@ -1137,6 +1178,11 @@ class DafeiyuDmPlugin(Star):
         P = self._P(umo)
         drift = self._drift_vals(umo)
         base = float(drift.get("base", P.base_p))
+        # v2.1.0 空闲日档：周末/节假日基础概率上浮（消息发起率的日历效应；
+        # 频率仍被每日上限/硬顶/间隔夹死——概率放开、频率夹死不变）
+        f_free = round(self.c_free_p_mult, 2) if self._is_free_day() else 1.0
+        if f_free != 1.0:
+            base = min(1.0, base * f_free)
         f_date = self._date_factor(umo)
         f_reply = self._rw_factor(umo)
         f_heat = self._heat_factor(rounds, umo)
@@ -1155,9 +1201,12 @@ class DafeiyuDmPlugin(Star):
         p = max(P.floor, p)
         p = p * float(self._st.get("mood", 1.0))
         p = min(1.0, p)
-        return p, {"base": round(base, 3), "date": f_date, "reply": round(f_reply, 2),
+        factors = {"base": round(base, 3), "date": f_date, "reply": round(f_reply, 2),
                    "heat": round(f_heat, 2), "afk": f_afk, "floor": P.floor,
                    "mood": float(self._st.get("mood", 1.0))}
+        if f_free != 1.0:
+            factors["free"] = f_free
+        return p, factors
 
     def _together_now(self, umo: str, now: float) -> tuple:
         """(是否处于'在一起'语境, 命中词, 已过分钟)。词表清空=功能关。"""
@@ -1542,7 +1591,8 @@ class DafeiyuDmPlugin(Star):
                 return False  # 你正在聊：顺延
             if self.c_greet_gap and now - float(self._st.get("last_dm_ts") or 0) < self.c_greet_gap * 60:
                 return False  # 刚发过别的主动：近距查重
-        text = await self._gen(template, umo=umo, kind=kind, veto_ok=self.c_ai_veto, veto_ctx=self._status_ctx(umo))
+        text = await self._gen(template, umo=umo, kind=kind, veto_ok=self.c_ai_veto,
+                               veto_ctx=self._status_ctx(umo) + self._stance_line(umo))
         if text is None:
             self._dlog({"t": f"{kind}_veto", "why": "AI否决"})
             return True  # 否决=今日销账（豁免线走不到这，这里只是概率分支被拦）
@@ -1574,8 +1624,11 @@ class DafeiyuDmPlugin(Star):
             s["pending_reply"] = {"sent_at": now, "kind": kind}
 
     def _status_ctx(self, umo: str) -> str:
-        """喂给内心戏的状态块（无状态的模型须显式给）"""
+        """喂给内心戏/正文/否决的事实块（v2.1.0 AI 感官包）：时间感官（多久没聊/
+        今天休不休息/几点）+ 离席·约定锚点 + 热度画像——模型不再靠猜"现在是什么情况"，
+        "拿几小时前的离席当正在离席"这类过期状态误判从根上断掉"""
         s = self._sess(umo)
+        now = time.time()
         fires = [d for d in (s.get("fires") or []) if d]
         days = "-"
         if fires:
@@ -1583,12 +1636,130 @@ class DafeiyuDmPlugin(Star):
                 days = (datetime.now().date() - datetime.strptime(sorted(fires)[-1], "%Y-%m-%d").date()).days
             except Exception:
                 pass
+        parts = []
+        wk = "周" + "一二三四五六日"[datetime.now().weekday()]
+        parts.append(f"今天是{wk}（{'休息日' if self._is_free_day() else '工作日'}）")
+        act = float(s.get("act_ts") or 0)
+        if act:
+            mins = max(0, int((now - act) // 60))
+            gap = f"{mins // 60} 小时 {mins % 60} 分钟" if mins >= 60 else f"{mins} 分钟"
+            anchor = ""
+            afk = s.get("afk") or {}
+            if isinstance(afk, dict) and afk.get("word"):
+                anchor = "，TA {} 说「{}」离开".format(
+                    datetime.fromtimestamp(float(afk.get("event") or act)).strftime("%H:%M"), afk["word"])
+            promise = s.get("promise") or {}
+            if isinstance(promise, dict) and promise.get("word"):
+                anchor += "，约过 {}「{}」还没兑现".format(
+                    datetime.fromtimestamp(float(promise.get("event") or act)).strftime("%H:%M"), promise["word"])
+            parts.append(f"距TA最后一条消息已 {gap}{anchor}")
+        rounds = self._heat_rounds(umo, now)
+        span = self._heat_span(umo, now)
+        if rounds:
+            hot = "、聊得很黏" if rounds >= self.c_heat_hot_min else ""
+            parts.append(f"沉默前 {span} 分钟里TA来了 {rounds} 轮{hot}" if span else f"窗口内TA来了 {rounds} 轮{hot}")
         v = float(s.get("exp_v", 0.6))
-        reply_line = f"回应热情（期待值 {v:.2f}，乘子 {self._rw_factor(umo):.2f}）"
-        return (
-            f"[背景事实：距上次主动找对方 {days} 天；对方近来的{reply_line}；"
-            f"今日已主动 {int(self._st.get('sent_total', 0))} 条；现在 {datetime.now().strftime('%H:%M')}]\n"
-        )
+        parts.append(f"距你上次主动找TA {days} 天；TA近来的回应热情（期待值 {v:.2f}，乘子 {self._rw_factor(umo):.2f}）")
+        parts.append(f"今日已主动 {int(self._st.get('sent_total', 0))} 条；现在 {datetime.now().strftime('%H:%M')}")
+        return "[背景事实：" + "；".join(parts) + "]\n"
+
+    def _heat_span(self, umo: str, now: float) -> int:
+        """热度窗口内首末消息的跨度（分钟）——画像行"聊了多久"用"""
+        s = self._sess(umo)
+        last = float(s.get("act_ts") or 0)
+        if not last:
+            return 0
+        win_lo = last - self.c_heat_win * 60
+        ts = [t for t in (s.get("msg_times") or []) if win_lo <= t <= last]
+        return int((ts[-1] - ts[0]) // 60) if len(ts) >= 2 else 0
+
+    def _stance_line(self, umo: str) -> str:
+        """判断心态段（v2.1.0）：QQ 映射 > 配置文件映射(含前缀/default) > 全局心态键。
+        只写判断先验不写说话风格——人设管"你是谁"，这段管"判断时往哪边想"。
+        空=功能关（用户清空即关）。"""
+        txt = ""
+        if self._stance_map:
+            qq = str(umo.split(":")[-1])
+            txt = self._stance_map.get("qq:" + qq) or ""
+            if not txt:
+                cid = self._conf_of(umo)
+                if cid:
+                    txt = self._stance_map.get("conf:" + cid.lower()) or ""
+                    if not txt:
+                        for k, v in self._stance_map.items():
+                            if k.startswith("conf:") and cid.lower().startswith(k[5:]):
+                                txt = v
+                                break
+            if not txt:
+                txt = self._stance_map.get("conf:default") or ""
+        if not txt:
+            txt = self.c_stance_hint
+        txt = txt.strip()
+        return f"[你的判断心态：{txt.replace('{who}', 'TA')}]\n" if txt else ""
+
+    def _cfg_write(self, key: str, value) -> bool:
+        """写回配置对象（先找所在分组，找不到落顶层；_flatten 两种都读得到）"""
+        cfg = self._cfg_obj
+        if not isinstance(cfg, dict):
+            return False
+        for k, v in cfg.items():
+            if isinstance(v, dict) and key in v:
+                v[key] = value
+                return True
+        cfg[key] = value
+        return True
+
+    async def _stance_gen_once(self):
+        """一次性心态段生成器（v2.1.0）：按当前默认人设写一段判断心态→写回配置→开关自动关回。
+        只在用户显式打开 dm_miss_stance_gen 时花这一次 token；任何失败开关保持开（下次重载重试）。
+        生成的是全局心态键；按配置/QQ 分流的条目请手填 miss_stance_conf_map。"""
+        try:
+            try:
+                provider = await self.context.get_using_provider_async(None)
+            except Exception:
+                provider = self.context.get_using_provider()
+            if provider is None:
+                logger.warning("[主动私聊] 心态段生成：无可用 LLM，开关保持开，下次重载重试")
+                return
+            persona_text = ""
+            try:
+                persona = await self.context.persona_manager.get_default_persona_v3(None)
+                if isinstance(persona, dict):
+                    persona_text = str(persona.get("prompt") or persona.get("system_prompt") or "")
+                elif persona is not None:
+                    persona_text = str(getattr(persona, "prompt", "") or getattr(persona, "system_prompt", ""))
+            except Exception:
+                persona_text = ""
+            if not persona_text:
+                logger.warning("[主动私聊] 心态段生成：取不到默认人设，开关保持开，下次重载重试")
+                return
+            prompt = (
+                "以下是一个聊天机器人的人设：\n" + persona_text[:2000]
+                + "\n\n请用第一人称为这个角色写一段「主动发消息前的判断心态」："
+                "它主动找人之前心里是怎么想的——想不想找、什么情况真的会按住、"
+                "拿不准时往哪边倒。只写判断时的心态倾向，不规定说话风格、不抄人设原文，"
+                "50~120字，口吻与人设一致。直接输出这段话本身，不要任何前后缀。"
+            )
+            resp = await asyncio.wait_for(
+                provider.text_chat(prompt=prompt, session_id=f"{PLUGIN_NAME}_stance"), timeout=30)
+            text = str(getattr(resp, "completion_text", "") or "").strip().strip('"“”')
+            if not text:
+                logger.warning("[主动私聊] 心态段生成：模型没给内容，开关保持开，下次重载重试")
+                return
+            text = text[:300]
+            self._cfg_write("dm_miss_stance_hint", text)
+            self._cfg_write("dm_miss_stance_gen", False)
+            try:
+                await self._cfg_obj.save_config_async()
+            except Exception:
+                try:
+                    self._cfg_obj.save_config()
+                except Exception:
+                    logger.warning("[主动私聊] 心态段已生成但配置落盘失败（本次运行内仍生效）", exc_info=True)
+            self.c_stance_hint = text
+            logger.info(f"[主动私聊] 心态段已按人设生成并写回（{len(text)}字），开关已自动关回：{text[:60]}")
+        except Exception:
+            logger.warning("[主动私聊] 心态段生成失败，开关保持开，下次重载重试", exc_info=True)
 
     # ---------- v1.5 静默评估器 ----------
 
@@ -1731,6 +1902,7 @@ class DafeiyuDmPlugin(Star):
                 self.tpl_miss_random, umo=umo, kind="random",
                 veto_ok=self.c_ai_veto,
                 veto_ctx=self._status_ctx(umo) + self._together_ctx(umo, now)
+                    + self._stance_line(umo)
                     + f"[本次情景：{tag}（{'去吃饭离席' if tier=='afk' else '约定未赴' if tier=='promise' else '聊嗨断线' if tier=='hot' else '普通冷场'}）]\n",
                 scenario=tag,
             )
