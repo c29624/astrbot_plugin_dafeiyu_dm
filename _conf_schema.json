@@ -12,10 +12,16 @@
       },
       "miss_temperament": {
         "description": "性格挡位（懒人一键）",
-        "hint": "不想研究参数就选一个挡位，她会接管这些数值：基础概率/冷却天数/想你每日上限/每日总量/随机次数(旧定时器)/回得慢与没回折扣/概率下限/想念半衰期与重想间隔/热度折扣与上浮/三档静默阈值/两次最短间隔/晨起睡前基线。平淡=各聊各的，一天最多一两次，想起也不太来；正常=安全型（=全部默认值）；热情=来得勤，被晾了也热情；病娇=全高：概率0.9、想你上限4、总量顶到7、最短间隔半小时、被晾完全不收敛——重い愛那种黏法，介意打扰勿选。想微调单项→选自定义，所有数值自己填。保险丝（评估时段/熔断/抑制词/硬顶）任何挡位都不动",
+        "hint": "不想研究参数就选一个挡位，她会接管这些数值：基础概率/期待值学习(学习率·奖励值·乘子区间)/冷却恢复(深度·常数)/触发尺度乘子/热度饱和(冷热限·半饱和轮数)/想你每日上限/每日总量/概率下限/想念半衰期与重想间隔/三档静默尺度/最短间隔/晨起睡前基线。平淡=各聊各的，被晾会慢慢真凉；正常=安全型（=全部默认值）；热情=来得勤，被晾了也热情；病娇=全高：学得慢、被晾不降期待、尺度×0.5 很快就开始想你——重い愛那种黏法，介意打扰勿选。想微调单项→选自定义，所有数值自己填。保险丝（评估时段/熔断/抑制词/硬顶）任何挡位都不动",
         "type": "string",
         "default": "自定义",
-        "options": ["平淡", "正常", "热情", "病娇", "自定义"],
+        "options": [
+          "平淡",
+          "正常",
+          "热情",
+          "病娇",
+          "自定义"
+        ],
         "obvious_hint": true
       },
       "miss_tier_per_conf": {
@@ -32,7 +38,7 @@
       },
       "miss_custom_slots": {
         "description": "自定义挡位槽（最多3个）",
-        "hint": "想给某人单独配一套数值又不想用固定挡：每项一行「槽名: 参数=值, 参数=值…」（槽名随意，别和固定挡重名，多的忽略）。可用参数：miss_base_p基础概率 / miss_cooldown_days冷却天数 / miss_daily_max想你上限 / dm_daily_cap每日总量 / miss_reply_slow_factor慢回折扣 / miss_reply_none_factor没回折扣 / miss_floor概率下限 / miss_retry_gap重想间隔(如3-6) / miss_retry_tau想念半衰期 / miss_heat_cold_factor冷场折扣 / miss_heat_hot_factor聊嗨上浮 / miss_afk_min吃饭档阈值 / miss_mid_min中档阈值 / miss_silence_min普通档阈值 / morning_base晨起基线 / evening_base睡前基线。没写的参数用全局值，数值自动夹进合法范围。例：专属挡位A: miss_base_p=0.8, miss_daily_max=2, miss_retry_tau=8。配好后在映射表写 10001=专属挡位A 即可；全局挡位选择填槽名也认",
+        "hint": "想给某人单独配一套数值又不想用固定挡：每项一行「槽名: 参数=值, 参数=值…」（槽名随意，别和固定挡重名，多的忽略）。可用参数：miss_base_p基础概率 / miss_rw_alpha期待值学习率 / miss_rw_r_fast|r_slow|r_none奖励值 / miss_rw_lo|hi乘子区间 / miss_cd_a|tau冷却深度与恢复 / miss_haz_k|scale触发形状与尺度 / miss_daily_max想你上限 / dm_daily_cap每日总量 / miss_floor概率下限 / miss_retry_gap重想间隔(如3-6) / miss_retry_tau想念半衰期 / miss_heat_cold_factor|hot_factor|k热度 / miss_afk_min|miss_mid_min|miss_silence_min三档尺度 / morning_base|evening_base晨晚基线。没写的参数用全局值，数值自动夹进合法范围。例：专属挡位A: miss_base_p=0.8, miss_daily_max=2, miss_retry_tau=8。配好后在映射表写 10001=专属挡位A 即可；全局挡位选择填槽名也认",
         "type": "list",
         "default": []
       },
@@ -102,7 +108,11 @@
         "hint": "silence=静默想你（v1.5 推荐：你多久没回话决定她想不想你，按概率掷骰）；timer=旧版定时抽签（每天在时间窗内随机抽时刻）；off=关闭随机想念",
         "type": "string",
         "default": "silence",
-        "options": ["silence", "timer", "off"]
+        "options": [
+          "silence",
+          "timer",
+          "off"
+        ]
       },
       "dm_morning_on": {
         "description": "晨起问候",
@@ -120,7 +130,15 @@
         "description": "道别词表",
         "hint": "你的消息含任一词=今晚你先道了别，她躺下时必来收尾（不受她入睡早晚影响）。子串匹配，留空=此规则关",
         "type": "list",
-        "default": ["晚安", "睡了", "先睡", "去睡", "睡觉啦", "睡觉了", "睡啦"]
+        "default": [
+          "晚安",
+          "睡了",
+          "先睡",
+          "去睡",
+          "睡觉啦",
+          "睡觉了",
+          "睡啦"
+        ]
       },
       "miss_night_words_from": {
         "description": "道别词·几点开始算",
@@ -132,7 +150,13 @@
         "description": "在一起语境词表",
         "hint": "对方私聊里说过这些词（如\"连麦一起看电影\"\"一起玩\"）→ 之后的窗口期内她主动来找你时避开\"想你/等你回来\"这种分开才说的话，改聊眼前的事——防\"明明在一起还说想你\"的穿帮。子串匹配，留空=此功能关",
         "type": "list",
-        "default": ["一起", "连麦", "牵着", "抱着", "陪你"]
+        "default": [
+          "一起",
+          "连麦",
+          "牵着",
+          "抱着",
+          "陪你"
+        ]
       },
       "miss_together_min": {
         "description": "在一起语境·持续多久",
@@ -235,11 +259,11 @@
     "type": "object",
     "title": "静默想你·触发与阈值",
     "description": "静默想你·触发与阈值",
-    "hint": "你最后一条消息之后沉默多久，她开始有机会想你：吃饭档/中档（约定未赴、聊嗨断线）/普通档三档阈值，每档另加 0~5 分钟随机微抖（内置不可配，防掐表）。性格挡位会接管三档阈值（病娇最快 25/50/60 分钟起想），单项只在自定义挡生效",
+    "hint": "你最后一条消息之后沉默多久，她开始想起你——Weibull 风险曲线：静默越久\"想起你\"的瞬时概率越高（k=2 时线性上升），没有\"满 N 分钟才开始想\"的到点悬崖。三档尺度（吃饭/约定聊嗨断线/普通）≈ 旧版阈值的位置感，另受每日 ±20% 微扰。性格挡位会接管（病娇整体 ×0.5 左移，平淡 ×1.5 右移）",
     "items": {
       "miss_afk_min": {
         "description": "吃饭档阈值（分钟）",
-        "hint": "你说过吃饭/洗澡/出门这类离席词后，静默到这个时长开始掷骰（10~120）。说词=马上离开，档位最短",
+        "hint": "你说过吃饭/洗澡/出门这类离席词后，这段静默的 Weibull 尺度（分钟，≈旧版阈值的手感，10~120）。说词=马上离开，档位最短",
         "type": "int",
         "default": 45,
         "slider": {
@@ -250,7 +274,7 @@
       },
       "miss_mid_min": {
         "description": "中档阈值（分钟）",
-        "hint": "两种情况用中档：①约定未赴（说了\"晚点找你\"没来找）②聊嗨了突然断线没交代（15~240）",
+        "hint": "两种情况用中档：①约定未赴（说了\"晚点找你\"没来找）②聊嗨了突然断线没交代（15~240）——同为尺度参数",
         "type": "int",
         "default": 90,
         "slider": {
@@ -261,7 +285,7 @@
       },
       "miss_silence_min": {
         "description": "普通档阈值（分钟）",
-        "hint": "普普通通聊完各忙各的，静默到这个时长开始掷骰（20~480）。三档会自动排序防配反",
+        "hint": "普普通通聊完各忙各的，这段静默的尺度（分钟，20~480）。三档会自动排序防配反",
         "type": "int",
         "default": 120,
         "slider": {
@@ -274,19 +298,63 @@
         "description": "离席词表",
         "hint": "你的消息里含任一词→该段静默按吃饭档（短阈值）。词是子串匹配：\"吃饭\"能命中\"我去吃饭了\"；分开发\"吃饭啦\"\"拜拜\"也算（词说出后 5 分钟内结束的对话仍算离席段）",
         "type": "list",
-        "default": ["吃饭", "干饭", "洗澡", "洗漱", "出门", "取快递", "上课", "上班", "下班", "加班", "打游戏"]
+        "default": [
+          "吃饭",
+          "干饭",
+          "洗澡",
+          "洗漱",
+          "出门",
+          "取快递",
+          "上课",
+          "上班",
+          "下班",
+          "加班",
+          "打游戏"
+        ]
       },
       "miss_promise_words": {
         "description": "约定词表",
         "hint": "你说了\"晚点找你\"这类话却一直没来→该段静默按中档。放鸽子的人反而更早被想起，就是这么真实；分开发送同享 5 分钟宽限",
         "type": "list",
-        "default": ["晚点找你", "等会找你", "等会儿找你", "待会找你", "待会聊", "晚上找你", "晚上聊", "回头找你", "回来找你"]
+        "default": [
+          "晚点找你",
+          "等会找你",
+          "等会儿找你",
+          "待会找你",
+          "待会聊",
+          "晚上找你",
+          "晚上聊",
+          "回头找你",
+          "回来找你"
+        ]
       },
       "miss_jitter": {
         "description": "中签后抖动期（分钟）",
         "hint": "格式\"低-高\"（如 10-40）：掷骰中了以后再随机等这么久才发——中签≠秒发，防规律。可填 0-0=中了立刻发（大字警告：发送瞬间若你正好回来，仍有五道门里的终检兜底，但窗口最小化）。夹紧 0~120",
         "type": "string",
         "default": "10-40"
+      },
+      "miss_haz_k": {
+        "description": "触发·风险形状 k",
+        "hint": "Weibull 形状参数（1.2~4.0，默认 2.0）：k 越大，\"静默越久越坐不住\"的加速越陡。全局固定一份，不分人",
+        "type": "float",
+        "default": 2.0,
+        "slider": {
+          "min": 1.2,
+          "max": 4.0,
+          "step": 0.1
+        }
+      },
+      "miss_haz_scale": {
+        "description": "触发·尺度乘子",
+        "hint": "三档静默尺度整体 ×这个值（0.3~2.0，默认 1.0）：调小=更早开始想起你，调大=更沉得住气。性格挡位会接管（病娇 0.5/平淡 1.5）",
+        "type": "float",
+        "default": 1.0,
+        "slider": {
+          "min": 0.3,
+          "max": 2.0,
+          "step": 0.05
+        }
       }
     }
   },
@@ -294,11 +362,11 @@
     "type": "object",
     "title": "静默想你·概率引擎",
     "description": "静默想你·概率引擎",
-    "hint": "到点不是必发，是掷骰：基础概率 × 日期档 × 回复反馈 × 热度档 × 离席折扣 → 总下限兜底 → 心情节律。每段静默掷 1~3 次（总次数随热度抽、没中隔随机几小时再想、概率随时间双曲衰减），你回来即翻篇。性格挡位选了平淡/正常/热情/病娇时，本节多数数值由挡位接管，单项只在自定义挡生效",
+    "hint": "到点不是必发，是掷骰：基础概率 × 日期冷却 × 期待值(养出来的) × 热度饱和 × 离席折扣 → 总下限兜底 → 心情节律；触发是 Weibull 风险曲线（静默越久越可能想起，无到点悬崖）。每段静默掷 1~3 次（没中隔随机几小时再想、概率随时间双曲衰减），你回来即翻篇。性格挡位选了平淡/正常/热情/病娇时，本节多数数值由挡位接管，单项只在自定义挡生效",
     "items": {
       "miss_base_p": {
         "description": "基础概率",
-        "hint": "每段静默到点掷骰的起点概率（0.05~1.0）。实际概率=基础×日期档×回复反馈×热度×离席折扣，最低不低于总下限",
+        "hint": "每次\"想起你\"掷骰的起点概率（0.05~1.0）。实际概率=基础×日期冷却×期待值×热度×离席折扣，最低不低于总下限",
         "type": "float",
         "default": 0.6,
         "slider": {
@@ -307,15 +375,92 @@
           "step": 0.05
         }
       },
-      "miss_cooldown_days": {
-        "description": "日期档·冷却天数",
-        "hint": "昨天刚主动找过→今天概率×0.35，前天找过→×0.65，出了窗口满血（1~7 天）。想改曲线只能改天数，曲线形状是定死的",
-        "type": "int",
-        "default": 2,
+      "miss_rw_alpha": {
+        "description": "期待值·学习率",
+        "hint": "Rescorla-Wagner 学习率（0.05~1.0，默认 0.30）：她的\"期待值\"被你的每次回应更新 V←V+α(r−V)。调大=学得快（几回就变），调小=慢热（要很久才改观）",
+        "type": "float",
+        "default": 0.3,
         "slider": {
-          "min": 1,
+          "min": 0.05,
+          "max": 1.0,
+          "step": 0.05
+        }
+      },
+      "miss_rw_r_fast": {
+        "description": "期待值·秒回奖励",
+        "hint": "秒回给多少奖励（0~1.0，默认 1.0）——你回得快，她的期待值往这靠",
+        "type": "float",
+        "default": 1.0,
+        "slider": {
+          "min": 0,
+          "max": 1,
+          "step": 0.05
+        }
+      },
+      "miss_rw_r_slow": {
+        "description": "期待值·慢回奖励",
+        "hint": "慢回给多少奖励（默认 0.60）——低于当前期待值就是往下教",
+        "type": "float",
+        "default": 0.6,
+        "slider": {
+          "min": 0,
+          "max": 1,
+          "step": 0.05
+        }
+      },
+      "miss_rw_r_none": {
+        "description": "期待值·没回惩罚",
+        "hint": "一直没回给多少奖励（默认 0.15）——被晾了她慢慢学乖；病娇挡配 0.85=被晾也几乎不降期待",
+        "type": "float",
+        "default": 0.15,
+        "slider": {
+          "min": 0,
+          "max": 1,
+          "step": 0.05
+        }
+      },
+      "miss_rw_lo": {
+        "description": "期待值·乘子下限",
+        "hint": "期待值 V∈[0,1] 映射成概率乘子的区间下限（默认 0.70，V=0 时）；区间决定你的回应最多能把她的概率抬/压多少",
+        "type": "float",
+        "default": 0.7,
+        "slider": {
+          "min": 0.3,
+          "max": 1.5,
+          "step": 0.05
+        }
+      },
+      "miss_rw_hi": {
+        "description": "期待值·乘子上限",
+        "hint": "映射区间上限（默认 1.20，V=1 时）。窄区间=你的回应影响小（平淡），宽/高区间=影响大",
+        "type": "float",
+        "default": 1.2,
+        "slider": {
+          "min": 0.4,
+          "max": 2.0,
+          "step": 0.05
+        }
+      },
+      "miss_cd_a": {
+        "description": "冷却·折扣深度",
+        "hint": "昨天刚主动找过→今天概率乘 1−a（默认 0.65 即 ×0.35）——指数恢复曲线的最深点",
+        "type": "float",
+        "default": 0.65,
+        "slider": {
+          "min": 0,
+          "max": 0.95,
+          "step": 0.05
+        }
+      },
+      "miss_cd_tau": {
+        "description": "冷却·恢复常数（天）",
+        "hint": "f(d)=1−a·e^(−(d−1)/τ)：昨天最深折扣，之后按 τ 指数回血（默认 0.9：前天≈0.74、大前天≈0.90）。空闲日自动 ×0.5 回血更快",
+        "type": "float",
+        "default": 0.9,
+        "slider": {
+          "min": 0.2,
           "max": 7,
-          "step": 1
+          "step": 0.1
         }
       },
       "miss_daily_max": {
@@ -331,7 +476,7 @@
       },
       "miss_reply_fast_min": {
         "description": "秒回界线（分钟）",
-        "hint": "她主动找你之后，这个时间内回=秒回（回复反馈=1.0 满档）",
+        "hint": "她主动找你之后，这个时间内回=秒回（奖励值走满档）",
         "type": "int",
         "default": 30,
         "slider": {
@@ -342,35 +487,13 @@
       },
       "miss_reply_slow_min": {
         "description": "晾着界线（分钟）",
-        "hint": "超过这个时长才回=回得慢（×0.85）；一直不回=晾着（×0.70），下次她更矜持",
+        "hint": "超过这个时长才回按慢回档给奖励；一直不回超过这个时长按没回档（懒结算），她慢慢学乖",
         "type": "int",
         "default": 720,
         "slider": {
           "min": 60,
           "max": 1440,
           "step": 30
-        }
-      },
-      "miss_reply_slow_factor": {
-        "description": "回得慢·折扣",
-        "hint": "0.1~1.0",
-        "type": "float",
-        "default": 0.85,
-        "slider": {
-          "min": 0.1,
-          "max": 1.0,
-          "step": 0.05
-        }
-      },
-      "miss_reply_none_factor": {
-        "description": "没回·折扣",
-        "hint": "0.1~1.0。上一次主动完全没回，下一次概率打折——被晾多了她会学着少来",
-        "type": "float",
-        "default": 0.7,
-        "slider": {
-          "min": 0.1,
-          "max": 1.0,
-          "step": 0.05
         }
       },
       "miss_floor": {
@@ -413,7 +536,7 @@
     "type": "object",
     "title": "静默想你·热度档",
     "description": "静默想你·热度档",
-    "hint": "\"一轮\"=统计窗口内、间隔小于聚合秒数的连续来言（连发几条算一轮）。聊嗨了突然断线→阈值降中档+概率上浮；全程冷场→概率打折",
+    "hint": "热度饱和曲线（v2.0.0）：f(r)=1+(上浮−1)·r/(K+r)，冷场折扣在前 cold_max 轮线性淡出——没有第 9/10 轮之间的悬崖。\"一轮\"=统计窗口内、间隔小于聚合秒数的连续来言；聊嗨档仍是语义标签（降中档尺度/饭档折扣池/重想次数用）",
     "items": {
       "miss_heat_on": {
         "description": "热度因子",
@@ -456,7 +579,7 @@
       },
       "miss_heat_cold_factor": {
         "description": "冷场折扣",
-        "hint": "0.1~2.0",
+        "hint": "零轮冷场时的折扣（饱和曲线下限，0.1~2.0）",
         "type": "float",
         "default": 0.7,
         "slider": {
@@ -478,13 +601,24 @@
       },
       "miss_heat_hot_factor": {
         "description": "聊嗨上浮",
-        "hint": "1.0~2.0。聊得火热突然消失，她最坐不住",
+        "hint": "聊嗨渐近上浮（饱和曲线上限，1.0~2.0）——轮数越多越接近、永不越过",
         "type": "float",
         "default": 1.25,
         "slider": {
           "min": 1.0,
           "max": 2.0,
           "step": 0.05
+        }
+      },
+      "miss_heat_k": {
+        "description": "饱和·半饱和轮数 K",
+        "hint": "热度响应 f(r)=1+(上浮−1)·r/(K+r)：r=K 时到达半饱和——K 就是\"几轮算热络\"（默认 10，2~30）。病娇挡 4=聊三轮她就到顶坐不住",
+        "type": "int",
+        "default": 10,
+        "slider": {
+          "min": 2,
+          "max": 30,
+          "step": 1
         }
       }
     }
@@ -493,20 +627,27 @@
     "type": "object",
     "title": "静默想你·日历",
     "description": "静默想你·日历",
-    "hint": "空闲日（周末/大小周/节假日）用更短的冷却窗口：休息日想念不用装矜持。调休补班优先级最高",
+    "hint": "空闲日（周末/大小周/节假日）冷却恢复常数 ×0.5：休息日想念不用装矜持。调休补班优先级最高",
     "items": {
       "miss_free_mode": {
         "description": "空闲日模式",
         "hint": "weekend=按固定星期几；pattern=大小周（需要锚日）；off=没有空闲日，全按工作日冷却",
         "type": "string",
         "default": "weekend",
-        "options": ["weekend", "pattern", "off"]
+        "options": [
+          "weekend",
+          "pattern",
+          "off"
+        ]
       },
       "miss_free_weekdays": {
         "description": "空闲星期几（固定模式）",
         "hint": "weekend 模式用：这些星期几算空闲日",
         "type": "list",
-        "default": ["周六", "周日"]
+        "default": [
+          "周六",
+          "周日"
+        ]
       },
       "miss_free_anchor": {
         "description": "大小周·锚日",
@@ -518,13 +659,18 @@
         "description": "大周·休哪几天",
         "hint": "大周（单休周）：默认只休周日",
         "type": "list",
-        "default": ["周日"]
+        "default": [
+          "周日"
+        ]
       },
       "miss_free_weekdays_small": {
         "description": "小周·休哪几天",
         "hint": "小周（双休周）：默认周六周日都休",
         "type": "list",
-        "default": ["周六", "周日"]
+        "default": [
+          "周六",
+          "周日"
+        ]
       },
       "miss_free_dates": {
         "description": "节假日表",
@@ -537,17 +683,6 @@
         "hint": "手动标记为工作日（优先级最高，压过节假日/大小周）。格式同上",
         "type": "list",
         "default": []
-      },
-      "miss_free_cooldown_days": {
-        "description": "空闲日·冷却天数",
-        "hint": "空闲日的日期档冷却窗口（默认1=次日满血，不用等2天）",
-        "type": "int",
-        "default": 1,
-        "slider": {
-          "min": 1,
-          "max": 7,
-          "step": 1
-        }
       }
     }
   },
@@ -562,7 +697,10 @@
         "hint": "auto=跟睡觉插件作息浮动（醒来+1h ~ 今晚入睡-30min，读不到则用手动值）；manual=用下面的固定时段",
         "type": "string",
         "default": "auto",
-        "options": ["auto", "manual"]
+        "options": [
+          "auto",
+          "manual"
+        ]
       },
       "miss_quiet_start": {
         "description": "评估时段·开始",
@@ -613,7 +751,13 @@
         "description": "显式抑制词",
         "hint": "你的消息含任一词→暂停主动这么多天（开新话题两次自动解冻）。",
         "type": "list",
-        "default": ["别发了", "别找我", "别烦我", "烦不烦", "让我静静"]
+        "default": [
+          "别发了",
+          "别找我",
+          "别烦我",
+          "烦不烦",
+          "让我静静"
+        ]
       },
       "miss_mute_days": {
         "description": "抑制持续天数",
@@ -640,21 +784,30 @@
         "hint": "ai=现场生成（花 token）；template=语料池抽句（0 token，语料池在\"模板\"节）",
         "type": "string",
         "default": "ai",
-        "options": ["ai", "template"]
+        "options": [
+          "ai",
+          "template"
+        ]
       },
       "dm_gen_mode_night": {
         "description": "睡前·生成方式",
         "hint": "同上",
         "type": "string",
         "default": "ai",
-        "options": ["ai", "template"]
+        "options": [
+          "ai",
+          "template"
+        ]
       },
       "dm_gen_mode_random": {
         "description": "想你·生成方式",
         "hint": "同上。⚠️ 想把你开了 AI 否决时必须用 ai——template 没有判断环节",
         "type": "string",
         "default": "ai",
-        "options": ["ai", "template"]
+        "options": [
+          "ai",
+          "template"
+        ]
       },
       "miss_ai_veto": {
         "description": "AI 否决层（要花 token，自选）",

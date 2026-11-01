@@ -15,6 +15,7 @@
 
 import asyncio
 import json
+import math
 import random
 import re
 import time
@@ -32,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.7.3"
+PLUGIN_VERSION = "2.0.0"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -41,8 +42,6 @@ NIGHT_WINDOW_MIN = 10  # 入睡点前多少分钟内发睡前消息
 ABS_TOTAL_CAP = 7     # 跨类型每日总量绝对上限（安全件，不可配）
 QUIET_HARD_LO = 8 * 60    # 评估时段硬边界 08:00
 QUIET_HARD_HI = 23 * 60 + 30  # …~23:30（风控：深夜不评估不发送）
-EVENT_WOBBLE_MIN = 0.0  # 事件级微抖 0~5 分钟（内置常量，防掐表底裤，不可配）
-EVENT_WOBBLE_MAX = 5.0
 AFK_GRACE_MIN = 5.0  # 离席/约定词宽限：词说出后对话在5分钟内结束→仍按该档（"吃饭啦""拜拜"分开发不丢档）
 MOOD_STEP = 0.15        # 心情节律随机游走幅度 ±15%
 DRIFT_STEP = 0.20       # 每日参数微扰幅度 ±20%
@@ -118,18 +117,27 @@ DEFAULTS = {
     "miss_tier_conf_map": [],          # "配置ID前缀=挡位" / "QQ=挡位" / "default=挡位"
     "miss_custom_slots": [],           # 自定义挡位槽（v1.7.2，最多3个）："名称: 参数=值, 参数=值…"
     "miss_base_p": 0.6,
-    "miss_cooldown_days": 2,          # 日期档回血窗口（天）
+    # —— v2.0.0 概率引擎换代 ——
+    "miss_rw_alpha": 0.30,            # Rescorla-Wagner 学习率：你的行为多快改变她的期待值
+    "miss_rw_r_fast": 1.0,            # 奖励值：秒回/慢回/没回各值多少
+    "miss_rw_r_slow": 0.60,
+    "miss_rw_r_none": 0.15,
+    "miss_rw_lo": 0.70,               # 期待值V∈[0,1]→概率乘子的映射区间
+    "miss_rw_hi": 1.20,
+    "miss_cd_a": 0.65,                # 冷却折扣深度：次日 f=1-a
+    "miss_cd_tau": 0.9,               # 冷却恢复时间常数（天），空闲日×0.5
+    "miss_haz_k": 2.0,                # Weibull 形状（风险随静默加速上升）
+    "miss_haz_scale": 1.0,            # 危险度尺度乘子（性格整体左移/右移触发曲线）
     "miss_daily_max": 1,              # 想你每日上限（1~5）
     "miss_reply_fast_min": 30,        # 秒回界线
     "miss_reply_slow_min": 720,       # 超过这数算晾着（12h）
-    "miss_reply_slow_factor": 0.85,
-    "miss_reply_none_factor": 0.70,
     "miss_floor": 0.30,               # 四因子连乘后的总下限
     "miss_heat_on": True,             # 热度因子总开关
-    "miss_heat_cold_max": 2,          # ≤此轮数=冷场档
-    "miss_heat_hot_min": 10,          # ≥此轮数=聊嗨档
-    "miss_heat_cold_factor": 0.70,
-    "miss_heat_hot_factor": 1.25,
+    "miss_heat_cold_max": 2,          # 冷场折扣在此轮数内线性淡出
+    "miss_heat_hot_min": 10,          # ≥此轮数=聊嗨档（语义标签/饭档池/重想次数仍用）
+    "miss_heat_k": 10,                # 饱和常数：几轮算热络（热度响应半饱和点）
+    "miss_heat_cold_factor": 0.70,    # 零轮冷场折扣（饱和曲线下限）
+    "miss_heat_hot_factor": 1.25,     # 聊嗨渐近上浮（饱和曲线上限）
     "miss_heat_burst_gap": 90,        # 一轮=连续来言间隔小于此秒数
     "miss_heat_window": 120,          # 热度统计窗口（分钟）
     "miss_free_mode": "weekend",      # weekend / pattern(大小周) / off
@@ -139,7 +147,6 @@ DEFAULTS = {
     "miss_free_weekdays_small": ["周六", "周日"],
     "miss_free_dates": [],            # 手动节假日表 "10-01" 或 "2026-10-01"
     "miss_busy_dates": [],            # 调休补班表（优先级最高）
-    "miss_free_cooldown_days": 1,     # 空闲档日期窗口（次日满血）
     "miss_afk_words": ["吃饭", "干饭", "洗澡", "洗漱", "出门", "取快递", "上课", "上班", "下班", "加班", "打游戏"],
     "miss_promise_words": ["晚点找你", "等会找你", "等会儿找你", "待会找你", "待会聊", "晚上找你", "晚上聊", "回头找你", "回来找你"],
     "miss_night_words": ["晚安", "睡了", "先睡", "去睡", "睡觉啦", "睡觉了", "睡啦"],  # 你先道别→她躺下必收尾（不因她睡晚漏掉）
@@ -184,29 +191,41 @@ DEFAULTS = {
 # 保险丝层（评估时段硬边界/熔断/抑制词/硬顶7）任何挡位都不碰——人味归挡位，等得起归保险丝。
 _TEMPERAMENTS = {
     "平淡": {"morning_base": 0.5, "evening_base": 0.35, "ov": {
-        "c_base_p": 0.35, "c_cd_days": 3, "c_daily_max": 1, "c_cap": 3, "c_random_n": 1,
-        "c_reply_slow_f": 0.70, "c_reply_none_f": 0.50, "c_floor": 0.15,
+        "c_base_p": 0.35, "c_daily_max": 1, "c_cap": 3, "c_random_n": 1,
+        "c_rw_alpha": 0.40, "c_rw_r_fast": 0.80, "c_rw_r_slow": 0.30, "c_rw_r_none": 0.00,
+        "c_rw_lo": 0.55, "c_rw_hi": 0.95,
+        "c_cd_a": 0.65, "c_cd_tau": 3.0, "c_floor": 0.15,
         "c_retry_gap_lo": 6.0, "c_retry_gap_hi": 12.0, "c_retry_tau": 2.0,
-        "c_heat_cold_f": 0.50, "c_heat_hot_f": 1.10,
-        "c_afk_min": 60, "c_mid_min": 120, "c_silence_min": 180, "c_gap": 3.0}},
+        "c_heat_cold_f": 0.50, "c_heat_hot_f": 1.10, "c_heat_k": 14,
+        "c_afk_min": 60, "c_mid_min": 120, "c_silence_min": 180,
+        "c_haz_scale": 1.5, "c_gap": 3.0}},
     "正常": {"morning_base": 0.7, "evening_base": 0.5, "ov": {
-        "c_base_p": 0.6, "c_cd_days": 2, "c_daily_max": 1, "c_cap": 4, "c_random_n": 2,
-        "c_reply_slow_f": 0.85, "c_reply_none_f": 0.70, "c_floor": 0.30,
+        "c_base_p": 0.6, "c_daily_max": 1, "c_cap": 4, "c_random_n": 2,
+        "c_rw_alpha": 0.30, "c_rw_r_fast": 1.00, "c_rw_r_slow": 0.60, "c_rw_r_none": 0.15,
+        "c_rw_lo": 0.70, "c_rw_hi": 1.20,
+        "c_cd_a": 0.65, "c_cd_tau": 0.9, "c_floor": 0.30,
         "c_retry_gap_lo": 3.0, "c_retry_gap_hi": 6.0, "c_retry_tau": 5.0,
-        "c_heat_cold_f": 0.70, "c_heat_hot_f": 1.25,
-        "c_afk_min": 45, "c_mid_min": 90, "c_silence_min": 120, "c_gap": 2.0}},
+        "c_heat_cold_f": 0.70, "c_heat_hot_f": 1.25, "c_heat_k": 10,
+        "c_afk_min": 45, "c_mid_min": 90, "c_silence_min": 120,
+        "c_haz_scale": 1.0, "c_gap": 2.0}},
     "热情": {"morning_base": 0.85, "evening_base": 0.65, "ov": {
-        "c_base_p": 0.75, "c_cd_days": 1, "c_daily_max": 2, "c_cap": 5, "c_random_n": 3,
-        "c_reply_slow_f": 0.95, "c_reply_none_f": 0.85, "c_floor": 0.40,
+        "c_base_p": 0.75, "c_daily_max": 2, "c_cap": 5, "c_random_n": 3,
+        "c_rw_alpha": 0.35, "c_rw_r_fast": 1.00, "c_rw_r_slow": 0.75, "c_rw_r_none": 0.40,
+        "c_rw_lo": 0.85, "c_rw_hi": 1.30,
+        "c_cd_a": 0.50, "c_cd_tau": 1.0, "c_floor": 0.40,
         "c_retry_gap_lo": 2.0, "c_retry_gap_hi": 4.0, "c_retry_tau": 8.0,
-        "c_heat_cold_f": 0.85, "c_heat_hot_f": 1.45,
-        "c_afk_min": 35, "c_mid_min": 75, "c_silence_min": 90, "c_gap": 1.0}},
+        "c_heat_cold_f": 0.85, "c_heat_hot_f": 1.45, "c_heat_k": 7,
+        "c_afk_min": 35, "c_mid_min": 75, "c_silence_min": 90,
+        "c_haz_scale": 0.75, "c_gap": 1.0}},
     "病娇": {"morning_base": 0.95, "evening_base": 0.8, "ov": {
-        "c_base_p": 0.90, "c_cd_days": 1, "c_daily_max": 4, "c_cap": 7, "c_random_n": 5,
-        "c_reply_slow_f": 1.00, "c_reply_none_f": 1.00, "c_floor": 0.55,
+        "c_base_p": 0.90, "c_daily_max": 4, "c_cap": 7, "c_random_n": 5,
+        "c_rw_alpha": 0.15, "c_rw_r_fast": 1.00, "c_rw_r_slow": 0.95, "c_rw_r_none": 0.85,
+        "c_rw_lo": 0.95, "c_rw_hi": 1.45,
+        "c_cd_a": 0.25, "c_cd_tau": 0.5, "c_floor": 0.55,
         "c_retry_gap_lo": 1.0, "c_retry_gap_hi": 2.0, "c_retry_tau": 12.0,
-        "c_heat_cold_f": 1.00, "c_heat_hot_f": 1.70,
-        "c_afk_min": 25, "c_mid_min": 50, "c_silence_min": 60, "c_gap": 0.5}},
+        "c_heat_cold_f": 1.00, "c_heat_hot_f": 1.70, "c_heat_k": 4,
+        "c_afk_min": 25, "c_mid_min": 50, "c_silence_min": 60,
+        "c_haz_scale": 0.5, "c_gap": 0.5}},
     "自定义": {"morning_base": 0.7, "evening_base": 0.5, "ov": {}},
 }
 # 旧挡位名迁移：淡泊/黏人是用户主动选过的性格→映射新名保留意图；标准是旧默认→转自定义，保住手动调过的数值
@@ -214,15 +233,23 @@ _TEMPERAMENT_MIGRATE = {"淡泊": "平淡", "标准": "自定义", "黏人": "�
 # 自定义挡位槽可写的参数键 → (c_属性/None=基线, 下限, 上限, 类型)；值按同款夹取范围收口
 _CUSTOM_KEYS = {
     "miss_base_p": ("c_base_p", 0.05, 1.0, float),
-    "miss_cooldown_days": ("c_cd_days", 1, 7, int),
     "miss_daily_max": ("c_daily_max", 1, 5, int),
     "dm_daily_cap": ("c_cap", 1, 7, int),
-    "miss_reply_slow_factor": ("c_reply_slow_f", 0.1, 1.0, float),
-    "miss_reply_none_factor": ("c_reply_none_f", 0.1, 1.0, float),
+    "miss_rw_alpha": ("c_rw_alpha", 0.05, 1.0, float),
+    "miss_rw_r_fast": ("c_rw_r_fast", 0.0, 1.0, float),
+    "miss_rw_r_slow": ("c_rw_r_slow", 0.0, 1.0, float),
+    "miss_rw_r_none": ("c_rw_r_none", 0.0, 1.0, float),
+    "miss_rw_lo": ("c_rw_lo", 0.3, 1.5, float),
+    "miss_rw_hi": ("c_rw_hi", 0.4, 2.0, float),
+    "miss_cd_a": ("c_cd_a", 0.0, 0.95, float),
+    "miss_cd_tau": ("c_cd_tau", 0.2, 7.0, float),
+    "miss_haz_k": ("c_haz_k", 1.2, 4.0, float),
+    "miss_haz_scale": ("c_haz_scale", 0.3, 2.0, float),
     "miss_floor": ("c_floor", 0.05, 0.9, float),
     "miss_retry_tau": ("c_retry_tau", 1.0, 12.0, float),
     "miss_heat_cold_factor": ("c_heat_cold_f", 0.1, 2.0, float),
     "miss_heat_hot_factor": ("c_heat_hot_f", 1.0, 2.0, float),
+    "miss_heat_k": ("c_heat_k", 2, 30, int),
     "miss_afk_min": ("c_afk_min", 10, 120, int),
     "miss_mid_min": ("c_mid_min", 15, 240, int),
     "miss_silence_min": ("c_silence_min", 20, 480, int),
@@ -378,12 +405,20 @@ class DafeiyuDmPlugin(Star):
         self.c_base_p = min(1.0, max(0.05, float(g("miss_base_p") or DEFAULTS["miss_base_p"])))
         self.c_morning_base = tp["morning_base"]
         self.c_evening_base = tp["evening_base"]
-        self.c_cd_days = min(7, max(1, int(g("miss_cooldown_days") or DEFAULTS["miss_cooldown_days"])))
+        # —— v2.0.0 概率引擎参数 ——
+        self.c_rw_alpha = min(1.0, max(0.05, float(g("miss_rw_alpha") or 0.30)))
+        self.c_rw_r_fast = min(1.0, max(0.0, float(g("miss_rw_r_fast") or 1.0)))
+        self.c_rw_r_slow = min(1.0, max(0.0, float(g("miss_rw_r_slow") or 0.60)))
+        self.c_rw_r_none = min(1.0, max(0.0, float(g("miss_rw_r_none") or 0.15)))
+        self.c_rw_lo = min(1.5, max(0.3, float(g("miss_rw_lo") or 0.70)))
+        self.c_rw_hi = min(2.0, max(self.c_rw_lo + 0.05, float(g("miss_rw_hi") or 1.20)))
+        self.c_cd_a = min(0.95, max(0.0, float(g("miss_cd_a") or 0.65)))
+        self.c_cd_tau = min(7.0, max(0.2, float(g("miss_cd_tau") or 0.9)))
+        self.c_haz_k = min(4.0, max(1.2, float(g("miss_haz_k") or 2.0)))
+        self.c_haz_scale = min(2.0, max(0.3, float(g("miss_haz_scale") or 1.0)))
         self.c_daily_max = min(5, max(1, int(g("miss_daily_max") or 1)))
         self.c_reply_fast = max(1, int(g("miss_reply_fast_min") or 30))
         self.c_reply_slow = max(60, int(g("miss_reply_slow_min") or 720))
-        self.c_reply_slow_f = min(1.0, max(0.1, float(g("miss_reply_slow_factor") or 0.85)))
-        self.c_reply_none_f = min(1.0, max(0.1, float(g("miss_reply_none_factor") or 0.70)))
         self.c_floor = min(0.9, max(0.05, float(g("miss_floor") or 0.30)))
         self.c_heat_on = bool(g("miss_heat_on"))
         self.c_heat_cold_max = min(5, max(1, int(g("miss_heat_cold_max") or 2)))
@@ -393,6 +428,7 @@ class DafeiyuDmPlugin(Star):
             logger.info(f"[主动私聊] 热度两档贴脸，聊嗨线已自动拉开到 {self.c_heat_hot_min}")
         self.c_heat_cold_f = float(g("miss_heat_cold_factor") or 0.70)
         self.c_heat_hot_f = float(g("miss_heat_hot_factor") or 1.25)
+        self.c_heat_k = min(30, max(2, int(g("miss_heat_k") or 10)))
         self.c_burst_gap = min(600, max(30, int(g("miss_heat_burst_gap") or 90)))
         self.c_heat_win = min(240, max(30, int(g("miss_heat_window") or 120)))
         self.c_free_mode = str(g("miss_free_mode") or "weekend").strip().lower()
@@ -404,7 +440,6 @@ class DafeiyuDmPlugin(Star):
         self.c_free_wd_small = self._parse_weekdays(g("miss_free_weekdays_small"), [5, 6])
         self.c_free_dates = self._parse_datelist(g("miss_free_dates"))
         self.c_busy_dates = self._parse_datelist(g("miss_busy_dates"))
-        self.c_free_cd = min(7, max(1, int(g("miss_free_cooldown_days") or 1)))
         self.c_afk_words = [str(w).strip() for w in (g("miss_afk_words") or []) if str(w).strip()]
         self.c_promise_words = [str(w).strip() for w in (g("miss_promise_words") or []) if str(w).strip()]
         self.c_night_words = [str(w).strip() for w in (g("miss_night_words") or []) if str(w).strip()]
@@ -495,11 +530,12 @@ class DafeiyuDmPlugin(Star):
 
     # ---------- v1.7.0 挡位按配置文件/QQ区分：按人分流的有效参数 ----------
 
-    _P_KEYS = ("base_p", "cd_days", "daily_max", "cap",
-               "reply_slow_f", "reply_none_f", "floor",
+    _P_KEYS = ("base_p", "daily_max", "cap",
+               "rw_alpha", "rw_r_fast", "rw_r_slow", "rw_r_none", "rw_lo", "rw_hi",
+               "cd_a", "cd_tau", "floor",
                "retry_gap_lo", "retry_gap_hi", "retry_tau",
-               "heat_cold_f", "heat_hot_f",
-               "afk_min", "mid_min", "silence_min",
+               "heat_cold_f", "heat_hot_f", "heat_k",
+               "afk_min", "mid_min", "silence_min", "haz_scale",
                "morning_base", "evening_base")
 
     def _build_p_global(self):
@@ -603,6 +639,34 @@ class DafeiyuDmPlugin(Star):
             return int(self._st.get(gk, 0))
         qq = str(umo.split(":")[-1])
         return int(((self._st.get("per") or {}).get(qq) or {}).get(key, 0))
+
+    # ---------- v2.0.0 概率引擎三件套：RW期待值 / Weibull触发 / 概率乘子 ----------
+
+    def _rw_factor(self, umo: str) -> float:
+        """期待值 V∈[0,1] → 概率乘子 [lo, hi]（性格决定区间，V 由相处养成）"""
+        P = self._P(umo)
+        v = float(self._sess(umo).get("exp_v", 0.6))
+        return P.rw_lo + (P.rw_hi - P.rw_lo) * v
+
+    def _rw_update(self, umo: str, r: float):
+        """Rescorla-Wagner 更新：V ← V + α(r−V)。秒回/慢回/没回各是一个奖励值，
+        她的期待值被你的每次回应平滑地教出来（不是阶跃 discount）"""
+        P = self._P(umo)
+        s = self._sess(umo)
+        v = float(s.get("exp_v", 0.6))
+        v = min(1.0, max(0.0, v + P.rw_alpha * (r - v)))
+        s["exp_v"] = round(v, 3)
+        self._dlog({"t": "rw", "umo": umo.split(":")[-1], "r": r, "v": round(v, 3),
+                    "factor": round(P.rw_lo + (P.rw_hi - P.rw_lo) * v, 2)})
+
+    def _haz_p(self, t: float, T: float) -> float:
+        """Weibull 触发（v2.0.0）：静默 t 秒、尺度 T 秒，本 tick"想起你"的概率。
+        瞬时风险 λ(t)=k·(t/T)^(k−1)/T，k=2 时风险随静默线性上升——
+        没有"静默满 N 分钟才开始想"的到点悬崖（v1.x 是阶跃阈值+wobble）"""
+        if t <= 0 or T <= 0:
+            return 0.0
+        h = self.c_haz_k * (t / T) ** (self.c_haz_k - 1) / T
+        return 1.0 - math.exp(-TICK_SECONDS * h)
 
     @staticmethod
     def _parse_date(value):
@@ -803,7 +867,7 @@ class DafeiyuDmPlugin(Star):
                 "unans": 0,            # 未回主动消息计数（熔断）
                 "mute_until": 0.0, "mute_openers": 0,
                 "afk": None, "promise": None,   # {word?, at, event}
-                "dice": None,          # {event, rolled, wobble, p, factors, result}
+                "dice": None,          # {event, rolled, n/max_n, t0/tau, haz, p, factors, tier, next_at, done}
                 "pending": None,       # {event, at} 中签后的抖动定时
             }
         return s
@@ -865,19 +929,17 @@ class DafeiyuDmPlugin(Star):
             s["msg_times"] = (s.get("msg_times") or []) + [now]
             cut = now - 26 * 3600
             s["msg_times"] = [t for t in s["msg_times"] if t >= cut]
-            # 回复反馈懒结算：挂着待观察 → 按延迟更新系数
+            # 回复反馈懒结算：挂着待观察 → 按延迟给奖励值，Rescorla-Wagner 更新期待值
             pr = s.get("pending_reply")
             if pr:
                 latency = now - float(pr.get("sent_at") or now)
                 if latency <= self.c_reply_fast * 60:
-                    f = 1.0
-                elif latency <= self.c_reply_slow * 60:
-                    f = self._P(umo).reply_slow_f
+                    r = self._P(umo).rw_r_fast
                 else:
-                    f = self._P(umo).reply_slow_f  # 超慢回按慢回档（真没回由懒结算按 none 档）
-                s["reply_factor"] = f
+                    r = self._P(umo).rw_r_slow  # 慢回/超慢回同档（真没回由懒结算按 none 档）
                 s["pending_reply"] = None
-                self._dlog({"t": "reply", "latency_min": round(latency / 60, 1), "factor": f})
+                self._rw_update(umo, r)
+                self._dlog({"t": "reply", "latency_min": round(latency / 60, 1), "r": r})
             # 熔断解冻：你说话了
             if s.get("unans"):
                 s["unans"] = 0
@@ -1008,6 +1070,9 @@ class DafeiyuDmPlugin(Star):
     # ---------- v1.5 概率引擎 ----------
 
     def _date_factor(self, umo: str) -> float:
+        """日期冷却（v2.0.0 指数恢复）：f(d)=1−a·e^(−(d−1)/τ)。
+        昨天来过折扣最深（f=1−a），之后按恢复常数 τ 指数回血（空闲日 τ×0.5 更快），
+        ≥0.97 视为满血——替代 v1.x 的三点折线（0.35/0.65/1.0）"""
         s = self._sess(umo)
         fires = [d for d in (s.get("fires") or []) if d]
         if not fires:
@@ -1016,22 +1081,28 @@ class DafeiyuDmPlugin(Star):
             last = datetime.strptime(sorted(fires)[-1], "%Y-%m-%d").date()
         except Exception:
             return 1.0
-        days = (datetime.now().date() - last).days
-        window = self.c_free_cd if self._is_free_day() else self._P(umo).cd_days
-        if window <= 1 or days > window:
-            return 1.0  # 出了冷却窗；最后一天仍在曲线上（如2天窗的第2天=0.65）
-        curve = {1: 0.35, 2: 0.65} if window == 2 else {1: 0.30, 2: 0.50, 3: 0.75}
-        return curve.get(days, 1.0)
+        d = (datetime.now().date() - last).days
+        if d < 1:
+            return 1.0
+        P = self._P(umo)
+        tau = P.cd_tau * (0.5 if self._is_free_day() else 1.0)
+        f = 1.0 - P.cd_a * math.exp(-(d - 1) / tau)
+        return 1.0 if f >= 0.97 else round(f, 3)
 
     def _heat_factor(self, rounds: int, umo: str = None) -> float:
+        """热度饱和曲线（v2.0.0）：f(r)=1+(hot−1)·r/(K+r)，冷场折扣在前 cold_max 轮线性淡出。
+        没有第 9 轮/第 10 轮之间的悬崖，K=半饱和轮数（几轮算热络）；r→∞ 渐近 hot_f"""
         if not self.c_heat_on:
             return 1.0
         P = self._P(umo) if umo else None
-        if rounds <= self.c_heat_cold_max:
-            return P.heat_cold_f if P else self.c_heat_cold_f
-        if rounds >= self.c_heat_hot_min:
-            return P.heat_hot_f if P else self.c_heat_hot_f
-        return 1.0
+        cold_f = P.heat_cold_f if P else self.c_heat_cold_f
+        hot_f = P.heat_hot_f if P else self.c_heat_hot_f
+        k = P.heat_k if P else self.c_heat_k
+        r = max(0, rounds)
+        f = 1.0 + (hot_f - 1.0) * r / (k + r)
+        if r < self.c_heat_cold_max:
+            f -= (1.0 - cold_f) * (1.0 - r / max(1, self.c_heat_cold_max))
+        return round(f, 3)
 
     def _tier_for(self, umo: str, now: float, rounds: int):
         """返回 (档名, 阈值分钟)。bot 自己发起没人回 ×1.5"""
@@ -1060,17 +1131,6 @@ class DafeiyuDmPlugin(Star):
             base = base * 1.5
         return tier, float(base)
 
-    def _event_wobble(self, umo: str, event: float) -> float:
-        """事件级微抖：每个静默事件掷一次（0~5min），存在 dice 里防逐 tick 重掷偏小"""
-        s = self._sess(umo)
-        d = s.get("dice")
-        if d and float(d.get("event") or 0) == event and "wobble" in d:
-            return float(d["wobble"])
-        if not d or float(d.get("event") or 0) != event:
-            d = s["dice"] = {"event": event}
-        d["wobble"] = random.uniform(EVENT_WOBBLE_MIN, EVENT_WOBBLE_MAX)
-        return float(d["wobble"])
-
     def _miss_probability(self, umo: str, tier: str, rounds: int) -> tuple:
         """四因子连乘→总下限→心情。返回 (p, 因子明细)"""
         s = self._sess(umo)
@@ -1078,7 +1138,7 @@ class DafeiyuDmPlugin(Star):
         drift = self._drift_vals(umo)
         base = float(drift.get("base", P.base_p))
         f_date = self._date_factor(umo)
-        f_reply = float(s.get("reply_factor") or 1.0)
+        f_reply = self._rw_factor(umo)
         f_heat = self._heat_factor(rounds, umo)
         # 吃饭档折扣随热度波动（v1.5.9）：饭前聊得越热折扣池越高，每次饭点在池内随机落点
         # ——聊嗨了去吃饭她坐不住（0.7~1.0），平平常常吃饭矜持（0.4~0.7），冷场散伙不来（0.1~0.4）
@@ -1136,7 +1196,7 @@ class DafeiyuDmPlugin(Star):
             return "吃饭"
         if tier in ("promise", "hot"):
             return "聊嗨断线" if tier == "hot" else "等约"
-        if float(s.get("reply_factor") or 1.0) < 1.0 and s.get("pending_reply") is None and days == 0:
+        if self._rw_factor(umo) < 1.0 and s.get("pending_reply") is None and days == 0:
             return "被晾"
         if days >= 3:
             return "久别"
@@ -1357,10 +1417,8 @@ class DafeiyuDmPlugin(Star):
         for umo, s in (self._st.get("sess") or {}).items():
             pr = s.get("pending_reply")
             if pr and now - float(pr.get("sent_at") or 0) > self.c_reply_slow * 60:
-                f_none = self._P(umo).reply_none_f
-                s["reply_factor"] = f_none
                 s["pending_reply"] = None
-                self._dlog({"t": "reply_none", "umo": umo.split(":")[-1], "factor": f_none})
+                self._rw_update(umo, self._P(umo).rw_r_none)
         self._save_state()
 
     def _night_bed_from_state(self, st: dict, now: float) -> float:
@@ -1525,10 +1583,10 @@ class DafeiyuDmPlugin(Star):
                 days = (datetime.now().date() - datetime.strptime(sorted(fires)[-1], "%Y-%m-%d").date()).days
             except Exception:
                 pass
-        rf = float(s.get("reply_factor") or 1.0)
-        reply_line = "无记录" if rf >= 1.0 else f"系数{rf}（{'没回过' if rf <= self.c_reply_none_f else '回得慢'}）"
+        v = float(s.get("exp_v", 0.6))
+        reply_line = f"回应热情（期待值 {v:.2f}，乘子 {self._rw_factor(umo):.2f}）"
         return (
-            f"[背景事实：距上次主动找对方 {days} 天；上次主动后对方{reply_line}；"
+            f"[背景事实：距上次主动找对方 {days} 天；对方近来的{reply_line}；"
             f"今日已主动 {int(self._st.get('sent_total', 0))} 条；现在 {datetime.now().strftime('%H:%M')}]\n"
         )
 
@@ -1578,9 +1636,6 @@ class DafeiyuDmPlugin(Star):
                 continue  # 跨夜长冷场交给晨起
             rounds = self._heat_rounds(umo, now)
             tier, base_thr = self._tier_for(umo, now, rounds)
-            thr = (base_thr + self._event_wobble(umo, ev)) * 60
-            if silence < thr:
-                continue
             d = s.get("dice")
             attempt = 1
             if d and float(d.get("event") or 0) == ev and d.get("rolled"):
@@ -1590,6 +1645,12 @@ class DafeiyuDmPlugin(Star):
                 if now < float(d.get("next_at") or 0):
                     continue
                 attempt = int(d.get("n") or 1) + 1
+            # v2.0.0 Weibull 触发：风险随静默时长连续上升（尺度=旧阈值×性格乘子×当日微扰），
+            # 本 tick 以 p_haz 掷"想起你"——替代"静默满 N 分钟才开始评估"的阶跃阈值
+            T_eff = base_thr * 60.0 * P.haz_scale
+            p_haz = self._haz_p(silence, T_eff)
+            if random.random() >= p_haz:
+                continue
             p, factors = self._miss_probability(umo, tier, rounds)
             if attempt == 1:
                 # 本事件总次数随热度抽（聊得越热她想起你的次数越多；抽的，观察不出固定数）
@@ -1621,7 +1682,7 @@ class DafeiyuDmPlugin(Star):
                 factors["retry"] = round(f_retry, 3)
             s["dice"] = {"event": ev, "rolled": True, "n": attempt, "max_n": max_n,
                          "t0": t0, "tau": round(tau_eff, 3),
-                         "wobble": self._event_wobble(umo, ev), "p": round(p, 3),
+                         "haz": round(p_haz, 4), "p": round(p, 3),
                          "factors": factors, "tier": tier,
                          "next_at": (now + random.uniform(P.retry_gap_lo, P.retry_gap_hi) * 3600)
                          if attempt < max_n else 0.0}
