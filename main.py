@@ -20,6 +20,7 @@ import re
 import time
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -31,7 +32,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.6.2"
+PLUGIN_VERSION = "1.7.0"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -113,6 +114,8 @@ DEFAULTS = {
     "miss_mid_min": 90,               # 中档：约定未赴 / 聊嗨断线
     "miss_afk_min": 45,               # 吃饭档：离席词命中
     "miss_temperament": "自定义",      # 平淡/正常/热情/病娇/自定义：懒人挡位一键接管数值
+    "miss_tier_per_conf": False,       # 挡位按配置文件/QQ区分（v1.7.0）
+    "miss_tier_conf_map": [],          # "配置ID前缀=挡位" / "QQ=挡位" / "default=挡位"
     "miss_base_p": 0.6,
     "miss_cooldown_days": 2,          # 日期档回血窗口（天）
     "miss_daily_max": 1,              # 想你每日上限（1~5）
@@ -379,6 +382,26 @@ class DafeiyuDmPlugin(Star):
                 setattr(self, _k, _v)
             logger.info(f"[主动私聊] 懒人挡位「{self.c_temperament}」已接管 {len(tp['ov'])} 项数值参数"
                         f"（单项配置仅自定义挡生效）")
+        # v1.7.0 挡位按配置文件/QQ区分：映射解析 + 全局参数快照（按人分流时在快照上叠挡位ov）
+        self.c_tier_per_conf = bool(g("miss_tier_per_conf"))
+        self._tier_map = {}
+        for _item in (g("miss_tier_conf_map") or []):
+            _s = str(_item).strip()
+            if "=" not in _s:
+                logger.warning(f"[主动私聊] 挡位映射「{_s}」没有=，跳过")
+                continue
+            _k, _, _v = _s.partition("=")
+            _k, _v = _k.strip(), str(_TEMPERAMENT_MIGRATE.get(_v.strip(), _v.strip()))
+            if _v not in _TEMPERAMENTS:
+                logger.warning(f"[主动私聊] 挡位映射「{_s}」挡位名不认识，跳过")
+                continue
+            self._tier_map[("qq:" + _k) if _k.isdigit() else ("conf:" + _k.lower())] = _v
+        if self.c_tier_per_conf and self._tier_map:
+            logger.info(f"[主动私聊] 挡位按配置文件/QQ区分已开：{sorted(self._tier_map.values())}"
+                        f"（{len(self._tier_map)} 条映射）")
+        self._conf_pid_cache = {}
+        self._p_cache = {}
+        self._p_global = self._build_p_global()
         self.tpl_miss_random = str(g("dm_miss_random_template") or DEFAULTS["dm_miss_random_template"])
         self.tpl_veto_hint = str(g("dm_miss_veto_hint") or DEFAULTS["dm_miss_veto_hint"])
         # 评估时段自动模式的缓存（读不到 sleep 时沿用上次推导）
@@ -404,6 +427,113 @@ class DafeiyuDmPlugin(Star):
             else:
                 flat[k] = v
         return flat
+
+    # ---------- v1.7.0 挡位按配置文件/QQ区分：按人分流的有效参数 ----------
+
+    _P_KEYS = ("base_p", "cd_days", "daily_max", "cap",
+               "reply_slow_f", "reply_none_f", "floor",
+               "retry_gap_lo", "retry_gap_hi", "retry_tau",
+               "heat_cold_f", "heat_hot_f",
+               "afk_min", "mid_min", "silence_min",
+               "morning_base", "evening_base")
+
+    def _build_p_global(self):
+        """全局参数快照（含全局挡位 ov 后的值）——开关关着时所有人共用这一份"""
+        ns = SimpleNamespace()
+        for k in self._P_KEYS:
+            setattr(ns, k, getattr(self, "c_" + k))
+        return ns
+
+    def _P(self, umo: str):
+        """该 umo 的有效参数：开关关=全局快照；开=按 QQ/配置文件解析挡位后叠加 ov"""
+        if not self.c_tier_per_conf:
+            return self._p_global
+        tier = self._tier_of(umo)
+        cached = self._p_cache.get(umo)
+        if cached and cached[0] == tier:
+            return cached[1]
+        tp = _TEMPERAMENTS[tier]
+        ns = SimpleNamespace()
+        for k in self._P_KEYS:
+            setattr(ns, k, getattr(self._p_global, k))
+        for k, v in tp["ov"].items():
+            attr = k[2:]
+            if hasattr(ns, attr):
+                setattr(ns, attr, v)
+        ns.morning_base = tp["morning_base"]
+        ns.evening_base = tp["evening_base"]
+        self._p_cache[umo] = (tier, ns)
+        return ns
+
+    def _tier_of(self, umo: str) -> str:
+        """QQ 映射 > 配置文件映射 > 全局挡位"""
+        if not self.c_tier_per_conf:
+            return self.c_temperament
+        qq = str(umo.split(":")[-1])
+        t = self._tier_map.get("qq:" + qq)
+        if t:
+            return t
+        cid = self._conf_of(umo)
+        if cid:
+            t = self._tier_map.get("conf:" + cid.lower())
+            if not t:  # 支持配置ID前缀匹配（面板里那串 UUID 只写开头几位）
+                for k, v in self._tier_map.items():
+                    if k.startswith("conf:") and cid.lower().startswith(k[5:]):
+                        t = v
+                        break
+        return t or self.c_temperament
+
+    def _conf_of(self, umo: str) -> str:
+        """umo → 配置文件ID：配置的 platform 列表里含该平台 → 该配置；找不到=default"""
+        pid = str(umo.split(":")[0])
+        if pid in self._conf_pid_cache:
+            return self._conf_pid_cache[pid]
+        cid = "default"
+        try:
+            confs = getattr(self.context.astrbot_config_mgr, "confs", {}) or {}
+            for kid, conf in (confs.items() if hasattr(confs, "items") else []):
+                for p in (conf.get("platform") or []):
+                    if isinstance(p, dict) and str(p.get("id")) == pid:
+                        cid = str(kid)
+                        break
+                if cid != "default":
+                    break
+        except Exception:
+            pass
+        self._conf_pid_cache[pid] = cid
+        return cid
+
+    def _drift_vals(self, umo: str) -> dict:
+        """当日微扰：开关关=全局 drift；开=每人一份懒掷（围绕该人挡位的参数滚 ±20%）"""
+        if not self.c_tier_per_conf:
+            return self._st.get("drift") or {}
+        qq = str(umo.split(":")[-1])
+        today = datetime.now().date().isoformat()
+        ent = (self._st.get("pdrift") or {}).get(qq)
+        if ent and ent.get("date") == today and bool(ent.get("on")) == bool(self.c_drift):
+            return ent.get("v") or {}
+        if not self.c_drift:
+            ent = {"date": today, "on": False, "v": None}
+        else:
+            P = self._P(umo)
+
+            def _dr(x, lo, hi):
+                v = x * random.uniform(1 - DRIFT_STEP, 1 + DRIFT_STEP)
+                return min(hi, max(lo, v))
+
+            ent = {"date": today, "on": True, "v": {
+                "silence": _dr(P.silence_min, 20, 480), "mid": _dr(P.mid_min, 15, 240),
+                "afk": _dr(P.afk_min, 10, 120), "base": _dr(P.base_p, 0.05, 1.0)}}
+        self._st.setdefault("pdrift", {})[qq] = ent
+        return ent.get("v") or {}
+
+    def _per_cnt(self, umo: str, key: str) -> int:
+        """当日按人计数（开关关=回落全局计数，键名对齐 sent_total/random_sent）"""
+        if not self.c_tier_per_conf:
+            gk = {"sent": "sent_total", "random": "random_sent"}.get(key, key)
+            return int(self._st.get(gk, 0))
+        qq = str(umo.split(":")[-1])
+        return int(((self._st.get("per") or {}).get(qq) or {}).get(key, 0))
 
     @staticmethod
     def _parse_date(value):
@@ -549,6 +679,9 @@ class DafeiyuDmPlugin(Star):
             }
         else:
             self._st["drift"] = None
+        # v1.7.0 按人区分的当日计数/每人微扰跨天清零（每人微扰当日懒掷，见 _drift_vals）
+        self._st["per"] = {}
+        self._st["pdrift"] = {}
         # 心情节律：多日随机游走 ±15%，夹在 [0.85, 1.15]
         mood = float(self._st.get("mood", 1.0)) + random.uniform(-MOOD_STEP, MOOD_STEP)
         self._st["mood"] = round(min(1 + MOOD_STEP, max(1 - MOOD_STEP, mood)), 3)
@@ -670,9 +803,9 @@ class DafeiyuDmPlugin(Star):
                 if latency <= self.c_reply_fast * 60:
                     f = 1.0
                 elif latency <= self.c_reply_slow * 60:
-                    f = self.c_reply_slow_f
+                    f = self._P(umo).reply_slow_f
                 else:
-                    f = self.c_reply_slow_f  # 超慢回按慢回档（真没回由懒结算按 none 档）
+                    f = self._P(umo).reply_slow_f  # 超慢回按慢回档（真没回由懒结算按 none 档）
                 s["reply_factor"] = f
                 s["pending_reply"] = None
                 self._dlog({"t": "reply", "latency_min": round(latency / 60, 1), "factor": f})
@@ -815,25 +948,27 @@ class DafeiyuDmPlugin(Star):
         except Exception:
             return 1.0
         days = (datetime.now().date() - last).days
-        window = self.c_free_cd if self._is_free_day() else self.c_cd_days
+        window = self.c_free_cd if self._is_free_day() else self._P(umo).cd_days
         if window <= 1 or days > window:
             return 1.0  # 出了冷却窗；最后一天仍在曲线上（如2天窗的第2天=0.65）
         curve = {1: 0.35, 2: 0.65} if window == 2 else {1: 0.30, 2: 0.50, 3: 0.75}
         return curve.get(days, 1.0)
 
-    def _heat_factor(self, rounds: int) -> float:
+    def _heat_factor(self, rounds: int, umo: str = None) -> float:
         if not self.c_heat_on:
             return 1.0
+        P = self._P(umo) if umo else None
         if rounds <= self.c_heat_cold_max:
-            return self.c_heat_cold_f
+            return P.heat_cold_f if P else self.c_heat_cold_f
         if rounds >= self.c_heat_hot_min:
-            return self.c_heat_hot_f
+            return P.heat_hot_f if P else self.c_heat_hot_f
         return 1.0
 
     def _tier_for(self, umo: str, now: float, rounds: int):
         """返回 (档名, 阈值分钟)。bot 自己发起没人回 ×1.5"""
         s = self._sess(umo)
-        drift = self._st.get("drift") or {}
+        drift = self._drift_vals(umo)
+        P = self._P(umo)
         ev = float(s.get("act_ts") or 0)
         afk = s.get("afk") or {}
         promise = s.get("promise") or {}
@@ -848,10 +983,10 @@ class DafeiyuDmPlugin(Star):
             tier = "hot"       # 聊嗨断线无交代 → 中档
         else:
             tier = "normal"
-        base = {"afk": drift.get("afk", self.c_afk_min),
-                "promise": drift.get("mid", self.c_mid_min),
-                "hot": drift.get("mid", self.c_mid_min),
-                "normal": drift.get("silence", self.c_silence_min)}[tier]
+        base = {"afk": drift.get("afk", P.afk_min),
+                "promise": drift.get("mid", P.mid_min),
+                "hot": drift.get("mid", P.mid_min),
+                "normal": drift.get("silence", P.silence_min)}[tier]
         if s.get("act_from") == "bot":  # 机器人自己发起没人回：×1.5
             base = base * 1.5
         return tier, float(base)
@@ -870,11 +1005,12 @@ class DafeiyuDmPlugin(Star):
     def _miss_probability(self, umo: str, tier: str, rounds: int) -> tuple:
         """四因子连乘→总下限→心情。返回 (p, 因子明细)"""
         s = self._sess(umo)
-        drift = self._st.get("drift") or {}
-        base = float(drift.get("base", self.c_base_p))
+        P = self._P(umo)
+        drift = self._drift_vals(umo)
+        base = float(drift.get("base", P.base_p))
         f_date = self._date_factor(umo)
         f_reply = float(s.get("reply_factor") or 1.0)
-        f_heat = self._heat_factor(rounds)
+        f_heat = self._heat_factor(rounds, umo)
         # 吃饭档折扣随热度波动（v1.5.9）：饭前聊得越热折扣池越高，每次饭点在池内随机落点
         # ——聊嗨了去吃饭她坐不住（0.7~1.0），平平常常吃饭矜持（0.4~0.7），冷场散伙不来（0.1~0.4）
         f_afk = 1.0
@@ -887,11 +1023,11 @@ class DafeiyuDmPlugin(Star):
                 lo, hi = 0.4, 0.7
             f_afk = round(random.uniform(lo, hi), 3)
         p = base * f_date * f_reply * f_heat * f_afk
-        p = max(self.c_floor, p)
+        p = max(P.floor, p)
         p = p * float(self._st.get("mood", 1.0))
         p = min(1.0, p)
         return p, {"base": round(base, 3), "date": f_date, "reply": round(f_reply, 2),
-                   "heat": round(f_heat, 2), "afk": f_afk, "floor": self.c_floor,
+                   "heat": round(f_heat, 2), "afk": f_afk, "floor": P.floor,
                    "mood": float(self._st.get("mood", 1.0))}
 
     def _together_now(self, umo: str, now: float) -> tuple:
@@ -1152,9 +1288,10 @@ class DafeiyuDmPlugin(Star):
         for umo, s in (self._st.get("sess") or {}).items():
             pr = s.get("pending_reply")
             if pr and now - float(pr.get("sent_at") or 0) > self.c_reply_slow * 60:
-                s["reply_factor"] = self.c_reply_none_f
+                f_none = self._P(umo).reply_none_f
+                s["reply_factor"] = f_none
                 s["pending_reply"] = None
-                self._dlog({"t": "reply_none", "umo": umo.split(":")[-1], "factor": self.c_reply_none_f})
+                self._dlog({"t": "reply_none", "umo": umo.split(":")[-1], "factor": f_none})
         self._save_state()
 
     def _night_bed_from_state(self, st: dict, now: float) -> float:
@@ -1214,7 +1351,7 @@ class DafeiyuDmPlugin(Star):
             said_bye = bool(bed_ts and bed_ts - 8 * 3600 <= gn <= bed_ts + 3600)
             if said_bye and f < 1.0:
                 f = 1.0
-            p = self.c_morning_base * f
+            p = self._P(umo).morning_base * f
             m["rolled"] = True
             m["p"] = round(p, 3)
             m["win"] = anchor or (random.random() < p)
@@ -1250,7 +1387,7 @@ class DafeiyuDmPlugin(Star):
         anchor = int(self._st.get("evening_skip", 0)) >= 2
         if not n.get("rolled"):
             owl_f = {"owl": 1.2, "mid": 1.0, "early": 0.7}[self._night_owl_level()]
-            p = self.c_evening_base * owl_f
+            p = self._P(umo).evening_base * owl_f
             n["rolled"] = True
             n["p"] = round(p, 3)
             n["win"] = chatted or anchor or (random.random() < p)
@@ -1297,6 +1434,12 @@ class DafeiyuDmPlugin(Star):
         """发出后的统一记账：总量/间隔/熔断计数/待观察"""
         self._st["sent_total"] = int(self._st.get("sent_total", 0)) + 1
         self._st["last_dm_ts"] = now
+        if self.c_tier_per_conf:  # 按人区分开着：每人自己的当日总量/想你想念计数
+            qq = str(umo.split(":")[-1])
+            d = self._st.setdefault("per", {}).setdefault(qq, {})
+            d["sent"] = int(d.get("sent", 0)) + 1
+            if kind == "random":
+                d["random"] = int(d.get("random", 0)) + 1
         s = self._sess(umo)
         s["unans"] = int(s.get("unans") or 0) + 1
         if kind == "random":
@@ -1353,9 +1496,10 @@ class DafeiyuDmPlugin(Star):
                 continue
             if int(s.get("unans") or 0) >= self.c_breaker:
                 continue  # 熔断中
-            if int(self._st.get("random_sent", 0)) >= self.c_daily_max:
+            P = self._P(umo)
+            if self._per_cnt(umo, "random") >= P.daily_max:
                 continue
-            if not self._quota_ok(now):
+            if not self._quota_ok(now, umo):
                 continue
             silence = now - ev
             if silence > 18 * 3600:
@@ -1393,11 +1537,11 @@ class DafeiyuDmPlugin(Star):
                     hm = random.uniform(0.6, 0.8)
                 else:
                     hm = random.uniform(0.9, 1.1)
-                tau_eff = self.c_retry_tau * hm
+                tau_eff = P.retry_tau * hm
                 t0 = now
             else:
                 max_n = int(d.get("max_n") or 1)
-                tau_eff = float(d.get("tau") or self.c_retry_tau)
+                tau_eff = float(d.get("tau") or P.retry_tau)
                 t0 = float(d.get("t0") or now)
                 # 重想衰减：双曲想念曲线 U=U0/(1+t/τ)——前快后慢带长尾（Mazur 双曲贴现在人头对头
                 # 比较里赢指数模型；ACT-R："还会被想起"的概率随时间幂律下降）。τ 第一次掷时就抽好。
@@ -1410,7 +1554,7 @@ class DafeiyuDmPlugin(Star):
                          "t0": t0, "tau": round(tau_eff, 3),
                          "wobble": self._event_wobble(umo, ev), "p": round(p, 3),
                          "factors": factors, "tier": tier,
-                         "next_at": (now + random.uniform(self.c_retry_gap_lo, self.c_retry_gap_hi) * 3600)
+                         "next_at": (now + random.uniform(P.retry_gap_lo, P.retry_gap_hi) * 3600)
                          if attempt < max_n else 0.0}
             if random.random() < p:
                 lo, hi = self.c_jitter_lo, self.c_jitter_hi
@@ -1437,9 +1581,9 @@ class DafeiyuDmPlugin(Star):
             return False, "显式抑制中"
         if int(s.get("unans") or 0) >= self.c_breaker:
             return False, "熔断中"
-        if int(self._st.get("random_sent", 0)) >= self.c_daily_max:
+        if self._per_cnt(umo, "random") >= self._P(umo).daily_max:
             return False, "今日上限"
-        if not self._quota_ok(now):
+        if not self._quota_ok(now, umo):
             return False, "频控(间隔/总量)"
         return True, ""
 
@@ -1479,9 +1623,17 @@ class DafeiyuDmPlugin(Star):
         self._bookkeep(umo, now, "random")
         self._dlog({"t": "miss_sent", "umo": umo.split(":")[-1], "tag": tag, "text": text[:30]})
 
-    def _quota_ok(self, now) -> bool:
-        if int(self._st.get("sent_total", 0)) >= self.c_cap:
-            return False
+    def _quota_ok(self, now, umo: str = None) -> bool:
+        """频控：总量/间隔。按人区分开着且有 umo → 每人自己的总量上限
+        （全局硬顶 ABS_TOTAL_CAP 与两次最短间隔是账户级保险丝，照旧全局管）"""
+        if umo and self.c_tier_per_conf:
+            if int(self._st.get("sent_total", 0)) >= ABS_TOTAL_CAP:
+                return False
+            if self._per_cnt(umo, "sent") >= self._P(umo).cap:
+                return False
+        else:
+            if int(self._st.get("sent_total", 0)) >= self.c_cap:
+                return False
         if now - float(self._st.get("last_dm_ts", 0)) < self.c_gap * 3600:
             return False
         return True
@@ -2105,7 +2257,8 @@ class DafeiyuDmPlugin(Star):
                     mu = s.get("mute_until") or 0
                     mute = f" 抑制至{datetime.fromtimestamp(mu).strftime('%m-%d %H:%M')}" if mu > datetime.now().timestamp() else ""
                     brk = f" 未回应{s.get('unans', 0)}" if s.get("unans") else ""
-                    lines.append(f"· {qq}：{dice_line}{pend}{mute}{brk}")
+                    tier = f" 挡位[{self._tier_of(umo)}]" if self.c_tier_per_conf else ""
+                    lines.append(f"· {qq}：{dice_line}{pend}{mute}{brk}{tier}")
         else:
             lines.append(
                 f"随机想念：今日 {self._st.get('random_sent', 0)}/{self.c_random_n} 发，"
