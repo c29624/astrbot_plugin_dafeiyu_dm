@@ -31,7 +31,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.5.8"
+PLUGIN_VERSION = "1.5.9"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -121,7 +121,6 @@ DEFAULTS = {
     "miss_reply_slow_factor": 0.85,
     "miss_reply_none_factor": 0.70,
     "miss_floor": 0.30,               # 四因子连乘后的总下限
-    "miss_afk_p_factor": 0.5,         # 离席触发的额外折扣
     "miss_heat_on": True,             # 热度因子总开关
     "miss_heat_cold_max": 2,          # ≤此轮数=冷场档
     "miss_heat_hot_min": 10,          # ≥此轮数=聊嗨档
@@ -287,7 +286,6 @@ class DafeiyuDmPlugin(Star):
         self.c_reply_slow_f = min(1.0, max(0.1, float(g("miss_reply_slow_factor") or 0.85)))
         self.c_reply_none_f = min(1.0, max(0.1, float(g("miss_reply_none_factor") or 0.70)))
         self.c_floor = min(0.9, max(0.05, float(g("miss_floor") or 0.30)))
-        self.c_afk_f = min(1.0, max(0.1, float(g("miss_afk_p_factor") or 0.5)))
         self.c_heat_on = bool(g("miss_heat_on"))
         self.c_heat_cold_max = min(5, max(1, int(g("miss_heat_cold_max") or 2)))
         self.c_heat_hot_min = min(50, max(4, int(g("miss_heat_hot_min") or 10)))
@@ -834,7 +832,17 @@ class DafeiyuDmPlugin(Star):
         f_date = self._date_factor(umo)
         f_reply = float(s.get("reply_factor") or 1.0)
         f_heat = self._heat_factor(rounds)
-        f_afk = self.c_afk_f if tier == "afk" else 1.0
+        # 吃饭档折扣随热度波动（v1.5.9）：饭前聊得越热折扣池越高，每次饭点在池内随机落点
+        # ——聊嗨了去吃饭她坐不住（0.7~1.0），平平常常吃饭矜持（0.4~0.7），冷场散伙不来（0.1~0.4）
+        f_afk = 1.0
+        if tier == "afk":
+            if rounds >= self.c_heat_hot_min:
+                lo, hi = 0.7, 1.0
+            elif rounds <= self.c_heat_cold_max:
+                lo, hi = 0.1, 0.4
+            else:
+                lo, hi = 0.4, 0.7
+            f_afk = round(random.uniform(lo, hi), 3)
         p = base * f_date * f_reply * f_heat * f_afk
         p = max(self.c_floor, p)
         p = p * float(self._st.get("mood", 1.0))
