@@ -1630,10 +1630,11 @@ class DafeiyuDmPlugin(Star):
         s = self._sess(umo)
         now = time.time()
         fires = [d for d in (s.get("fires") or []) if d]
-        days = "-"
+        days_line = "距你上次主动找TA 已隔很久（没有近期记录）"
         if fires:
             try:
-                days = (datetime.now().date() - datetime.strptime(sorted(fires)[-1], "%Y-%m-%d").date()).days
+                dd = (datetime.now().date() - datetime.strptime(sorted(fires)[-1], "%Y-%m-%d").date()).days
+                days_line = f"距你上次主动找TA {dd} 天"
             except Exception:
                 pass
         parts = []
@@ -1659,7 +1660,7 @@ class DafeiyuDmPlugin(Star):
             hot = "、聊得很黏" if rounds >= self.c_heat_hot_min else ""
             parts.append(f"沉默前 {span} 分钟里TA来了 {rounds} 轮{hot}" if span else f"窗口内TA来了 {rounds} 轮{hot}")
         v = float(s.get("exp_v", 0.6))
-        parts.append(f"距你上次主动找TA {days} 天；TA近来的回应热情（期待值 {v:.2f}，乘子 {self._rw_factor(umo):.2f}）")
+        parts.append(days_line + f"；TA近来的回应热情（期待值 {v:.2f}，乘子 {self._rw_factor(umo):.2f}）")
         parts.append(f"今日已主动 {int(self._st.get('sent_total', 0))} 条；现在 {datetime.now().strftime('%H:%M')}")
         return "[背景事实：" + "；".join(parts) + "]\n"
 
