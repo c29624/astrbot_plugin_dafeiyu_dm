@@ -31,7 +31,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.5.6"
+PLUGIN_VERSION = "1.5.7"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -1125,12 +1125,16 @@ class DafeiyuDmPlugin(Star):
         pid, qq = next(iter(tmap.items()))[0], next(iter(tmap.items()))[1][0]
         umo = f"{pid}:FriendMessage:{qq}"
         s = self._sess(umo)
-        # 存稿：睡眠期来言 → 冲刷管线带晨间内容，dm 不重复报到（拍板合并）
+        # 存稿/冲刷让位：睡眠期来言被睡觉插件守门截停，dm 自己看不见（v1.5.7 修复）——
+        # 直接读睡觉插件的"晨间冲刷已发生"标记；夜间来言本会触发冲刷，晨间内容已带出，不重复报到
         night_in = s.get("night_in") or {}
-        if night_in:
+        mf = (self._sleep_state() or {}).get("morning_flushed") or {}
+        flushed = mf.get("date") == datetime.now().date().isoformat() and umo in (mf.get("umos") or [])
+        if night_in or flushed:
             m["sent"] = True
-            s["night_in"] = {}
-            self._dlog({"t": "morning_skip", "why": "存稿在,让位晨间冲刷"})
+            if night_in:
+                s["night_in"] = {}
+            self._dlog({"t": "morning_skip", "why": "存稿在,让位晨间冲刷" if night_in else "晨间冲刷已发生,让位"})
             return
         # 用户醒后已先开口 → 冲刷已带出晨间内容
         if wake_ts and await self._user_spoke_after(umo, wake_ts):
@@ -1146,12 +1150,18 @@ class DafeiyuDmPlugin(Star):
             if bed_ts:
                 presleep = len([t for t in (s.get("msg_times") or []) if bed_ts - 3600 <= t <= bed_ts])
             f = 1.2 if presleep >= 10 else (0.75 if presleep < 3 else 1.0)
+            # 早安版道别对等（v1.5.7）：你当晚道过晚安（同晚8h内）→ 取消"睡前没聊"折扣——
+            # 你早睡早道别不该因她睡得晚（睡前一小时你已睡着）被降早安概率
+            gn = float(s.get("goodnight_ts") or 0)
+            said_bye = bool(bed_ts and bed_ts - 8 * 3600 <= gn <= bed_ts + 3600)
+            if said_bye and f < 1.0:
+                f = 1.0
             p = self.c_morning_base * f
             m["rolled"] = True
             m["p"] = round(p, 3)
             m["win"] = anchor or (random.random() < p)
             self._dlog({"t": "morning_roll", "p": round(p, 3), "presleep": presleep,
-                        "anchor": anchor, "win": m["win"]})
+                        "said_bye": said_bye, "anchor": anchor, "win": m["win"]})
         if m.get("win"):
             sent = await self._send_greet("morning", umo, self.tpl_morning, now, force=anchor)
             if sent or m["tries"] >= 6:
