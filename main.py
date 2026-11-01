@@ -31,7 +31,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "1.5.10"
+PLUGIN_VERSION = "1.6.0"
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -112,7 +112,7 @@ DEFAULTS = {
     "miss_silence_min": 120,          # 普通档阈值（分钟）
     "miss_mid_min": 90,               # 中档：约定未赴 / 聊嗨断线
     "miss_afk_min": 45,               # 吃饭档：离席词命中
-    "miss_temperament": "标准",        # 淡泊/标准/黏人：一键设 base_p/窗口/早晚安基线
+    "miss_temperament": "自定义",      # 平淡/正常/热情/病娇/自定义：懒人挡位一键接管数值
     "miss_base_p": 0.6,
     "miss_cooldown_days": 2,          # 日期档回血窗口（天）
     "miss_daily_max": 1,              # 想你每日上限（1~5）
@@ -173,11 +173,39 @@ DEFAULTS = {
 }
 
 # 性格预设映射（只动这四个键，其余因子不碰）
+# 懒人挡位（v1.6.0）：ov=选了该挡位后一键覆盖的参数终值（都已按夹取范围给）。
+# 数值锚点：依恋理论——回避型低频短消息/焦虑型高频长消息+过度寻求确认(Evraire&Dozois 2022)，
+# 平淡≈回避型、正常≈安全型(=全部默认值)、热情≈焦虑型轻症；病娇=焦虑型极端化的"重い愛"演绎，全高。
+# 保险丝层（评估时段硬边界/熔断/抑制词/硬顶7）任何挡位都不碰——人味归挡位，等得起归保险丝。
 _TEMPERAMENTS = {
-    "淡泊": {"miss_base_p": 0.35, "miss_cooldown_days": 3, "morning_base": 0.5, "evening_base": 0.35},
-    "标准": {"miss_base_p": 0.6, "miss_cooldown_days": 2, "morning_base": 0.7, "evening_base": 0.5},
-    "黏人": {"miss_base_p": 0.8, "miss_cooldown_days": 1, "morning_base": 0.85, "evening_base": 0.65},
+    "平淡": {"morning_base": 0.5, "evening_base": 0.35, "ov": {
+        "c_base_p": 0.35, "c_cd_days": 3, "c_daily_max": 1, "c_cap": 3, "c_random_n": 1,
+        "c_reply_slow_f": 0.70, "c_reply_none_f": 0.50, "c_floor": 0.15,
+        "c_retry_gap_lo": 6.0, "c_retry_gap_hi": 12.0, "c_retry_decay": 0.50,
+        "c_heat_cold_f": 0.50, "c_heat_hot_f": 1.10,
+        "c_afk_min": 60, "c_mid_min": 120, "c_silence_min": 180, "c_gap": 3.0}},
+    "正常": {"morning_base": 0.7, "evening_base": 0.5, "ov": {
+        "c_base_p": 0.6, "c_cd_days": 2, "c_daily_max": 1, "c_cap": 4, "c_random_n": 2,
+        "c_reply_slow_f": 0.85, "c_reply_none_f": 0.70, "c_floor": 0.30,
+        "c_retry_gap_lo": 3.0, "c_retry_gap_hi": 6.0, "c_retry_decay": 0.70,
+        "c_heat_cold_f": 0.70, "c_heat_hot_f": 1.25,
+        "c_afk_min": 45, "c_mid_min": 90, "c_silence_min": 120, "c_gap": 2.0}},
+    "热情": {"morning_base": 0.85, "evening_base": 0.65, "ov": {
+        "c_base_p": 0.75, "c_cd_days": 1, "c_daily_max": 2, "c_cap": 5, "c_random_n": 3,
+        "c_reply_slow_f": 0.95, "c_reply_none_f": 0.85, "c_floor": 0.40,
+        "c_retry_gap_lo": 2.0, "c_retry_gap_hi": 4.0, "c_retry_decay": 0.85,
+        "c_heat_cold_f": 0.85, "c_heat_hot_f": 1.45,
+        "c_afk_min": 35, "c_mid_min": 75, "c_silence_min": 90, "c_gap": 1.0}},
+    "病娇": {"morning_base": 0.95, "evening_base": 0.8, "ov": {
+        "c_base_p": 0.90, "c_cd_days": 1, "c_daily_max": 4, "c_cap": 7, "c_random_n": 5,
+        "c_reply_slow_f": 1.00, "c_reply_none_f": 1.00, "c_floor": 0.55,
+        "c_retry_gap_lo": 1.0, "c_retry_gap_hi": 2.0, "c_retry_decay": 0.95,
+        "c_heat_cold_f": 1.00, "c_heat_hot_f": 1.70,
+        "c_afk_min": 25, "c_mid_min": 50, "c_silence_min": 60, "c_gap": 0.5}},
+    "自定义": {"morning_base": 0.7, "evening_base": 0.5, "ov": {}},
 }
+# 旧挡位名迁移：淡泊/黏人是用户主动选过的性格→映射新名保留意图；标准是旧默认→转自定义，保住手动调过的数值
+_TEMPERAMENT_MIGRATE = {"淡泊": "平淡", "标准": "自定义", "黏人": "热情"}
 _WEEKDAY_NAMES = {"周一": 0, "周二": 1, "周三": 2, "周四": 3, "周五": 4, "周六": 5, "周日": 6}
 
 
@@ -275,13 +303,14 @@ class DafeiyuDmPlugin(Star):
         if (self.c_afk_min, self.c_mid_min, self.c_silence_min) != (afk, mid, sil):
             logger.info(f"[主动私聊] 三档阈值配乱序({afk}/{mid}/{sil})，已自动排序为 "
                         f"{self.c_afk_min}/{self.c_mid_min}/{self.c_silence_min}")
-        temper = str(g("miss_temperament") or "标准")
-        self.c_temperament = temper if temper in _TEMPERAMENTS else "标准"
+        temper_raw = str(g("miss_temperament") or "自定义")
+        temper = _TEMPERAMENT_MIGRATE.get(temper_raw, temper_raw)  # 旧名迁移（淡泊/标准/黏人）
+        self.c_temperament = temper if temper in _TEMPERAMENTS else "自定义"
         tp = _TEMPERAMENTS[self.c_temperament]
-        self.c_base_p = min(1.0, max(0.05, float(g("miss_base_p") or tp["miss_base_p"])))
+        self.c_base_p = min(1.0, max(0.05, float(g("miss_base_p") or DEFAULTS["miss_base_p"])))
         self.c_morning_base = tp["morning_base"]
         self.c_evening_base = tp["evening_base"]
-        self.c_cd_days = min(7, max(1, int(g("miss_cooldown_days") or tp["miss_cooldown_days"])))
+        self.c_cd_days = min(7, max(1, int(g("miss_cooldown_days") or DEFAULTS["miss_cooldown_days"])))
         self.c_daily_max = min(5, max(1, int(g("miss_daily_max") or 1)))
         self.c_reply_fast = max(1, int(g("miss_reply_fast_min") or 30))
         self.c_reply_slow = max(60, int(g("miss_reply_slow_min") or 720))
@@ -344,6 +373,12 @@ class DafeiyuDmPlugin(Star):
             "makeup": str(g("dm_gen_mode_night") or "ai"),
         }
         self.c_scenario_map = self._parse_scenario_map(g("dm_tools_scenario_map"))
+        # 懒人挡位兜底覆盖（v1.6.0）：选了具体挡位=数值由挡位说了算；自定义=上面的单项全生效
+        if tp["ov"]:
+            for _k, _v in tp["ov"].items():
+                setattr(self, _k, _v)
+            logger.info(f"[主动私聊] 懒人挡位「{self.c_temperament}」已接管 {len(tp['ov'])} 项数值参数"
+                        f"（单项配置仅自定义挡生效）")
         self.tpl_miss_random = str(g("dm_miss_random_template") or DEFAULTS["dm_miss_random_template"])
         self.tpl_veto_hint = str(g("dm_miss_veto_hint") or DEFAULTS["dm_miss_veto_hint"])
         # 评估时段自动模式的缓存（读不到 sleep 时沿用上次推导）
