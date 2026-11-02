@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.2.2"
+PLUGIN_VERSION = "2.3.0"
 DM_PERSONA_SLICE = 2600  # v2.2.0：人设切片上限（旧1500装不下"唯一的"的说话规则段；主动消息日均≤7条，token 代价可忽略）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -44,7 +44,24 @@ ABS_TOTAL_CAP = 7     # 跨类型每日总量绝对上限（安全件，不可�
 QUIET_HARD_LO = 8 * 60    # 评估时段硬边界 08:00
 QUIET_HARD_HI = 23 * 60 + 30  # …~23:30（风控：深夜不评估不发送）
 AFK_GRACE_MIN = 5.0  # 离席/约定词宽限：词说出后对话在5分钟内结束→仍按该档（"吃饭啦""拜拜"分开发不丢档）
+# v2.3.0 回归问候：离席词预期时长先验（分钟；被学习表中位数覆盖）
+AFK_DUR_PRIOR = {"洗澡": 45, "洗漱": 45, "吃饭": 75, "干饭": 75, "出门": 90, "取快递": 90,
+                 "下班": 60, "打游戏": 150, "上课": 480, "上班": 540, "加班": 600}
 MOOD_STEP = 0.15        # 心情节律随机游走幅度 ±15%
+# v2.3.0 回归问候曲线常量（不暴露配置）
+AFK_CHECK_WIN_MIN = 90            # 回归窗宽（分钟）
+AFK_CHECK_PEAK_MIN = 20           # 对数正态 hazard 峰位（开窗后分钟）
+AFK_CHECK_SIGMA = 0.6             # 对数正态 σ
+INTENT_POOL_PROMISE = (1.2, 1.5)  # 约定在身掷骰池（明确契约，冷热少打折）
+# 普通/告别池随 T 弹性：c_plain=0.55+0.3T / c_bye=min(0.35+0.5T,0.7)，池=c±0.1，告别顶钳 0.8
+REUNION_E_LO, REUNION_E_HI = 6 * 3600, 36 * 3600   # 重逢 E_eff 钳位（秒）
+REUNION_TIERS = ((2, 48 * 3600, 72 * 3600),        # (倍数, 绝对下限, 绝对上限) 轻哼 2~3 天
+                 (4, 96 * 3600, 120 * 3600),        # 明显 4~5 天
+                 (8, 168 * 3600, 240 * 3600))       # 大委屈 7~10 天封顶
+SULK_THR_BASE_H, SULK_THR_SPAN_H = 3.0, 2.0        # 小委屈阈值中心=3h−2h×热度
+SULK_THR_CLAMP = (40 / 60, 4.0)                    # 钳 40min~4h
+SULK_NIGHT_ADD_H = 8.0                             # 夜间 22~09 发出的 +8h（睡着不算晾）
+SULK_VALID_H = 48.0                                # 小委屈状态有效期
 DRIFT_STEP = 0.20       # 每日参数微扰幅度 ±20%
 
 DEFAULTS = {
@@ -162,6 +179,22 @@ DEFAULTS = {
     "miss_retry_tau": 5,              # 想念半衰期（小时）：重想概率=U0/(1+t/τ)双曲衰减，τ随热度伸缩
     "miss_jitter": "10-40",           # 抖动期"低-高"（分钟），可 0-0
     "miss_drift": True,               # 每日参数微扰 ±20%
+    # —— v2.3.0 ——
+    "miss_cd_a_learn": True,          # date 深度耦合 V（他怎么回应她→她的矜持深浅）
+    "miss_cd_a_lo": 0.45,
+    "miss_cd_a_hi": 0.80,
+    "miss_cd_a_slope": 1.0,
+    "miss_afk_check_on": False,       # 回归问候（opt-in：新增行为，用户决定）
+    "miss_afk_dur_map": [],           # "词=分钟" 覆盖先验
+    "miss_afk_refuse_words": ["别找我", "让我静静", "不想聊", "别烦我", "想静静"],
+    "miss_afk_bye_words": ["拜拜", "再见", "回见"],
+    "dm_afk_check_template": (
+        "他之前说{afk_word}离开，按你们的相处这个点该回来了，人却没冒头。"
+        "你想主动问一句——「下班了吗」「该理我了吧」的意思，用你自己的说法。"
+        "就一两句，别提系统。"
+    ),
+    "dm_reunion_on": True,            # 重逢委屈（生成侧事实注入）
+    "dm_sulk_on": True,               # 被晾小委屈（生成侧事实注入）
     "miss_quiet_mode": "auto",        # auto=跟睡眠作息 / manual=用手动时段
     "miss_quiet_start": "10:00",
     "miss_quiet_end": "22:30",
@@ -476,6 +509,22 @@ class DafeiyuDmPlugin(Star):
             self.c_retry_gap_lo, self.c_retry_gap_hi = self.c_retry_gap_hi, self.c_retry_gap_lo
         self.c_retry_tau = min(12.0, max(1.0, float(g("miss_retry_tau") or 5)))
         self.c_drift = bool(g("miss_drift"))
+        # v2.3.0
+        self.c_cd_a_learn = bool(g("miss_cd_a_learn"))
+        self.c_cd_a_lo = float(g("miss_cd_a_lo") or 0.45)
+        self.c_cd_a_hi = float(g("miss_cd_a_hi") or 0.80)
+        self.c_cd_a_slope = float(g("miss_cd_a_slope") or 1.0)
+        self.c_afk_check_on = bool(g("miss_afk_check_on"))
+        self.c_afk_dur_map = {}
+        for _s in list(g("miss_afk_dur_map") or []):
+            _k, _sep, _v = str(_s).partition("=")
+            if _sep and _k.strip() and _v.strip().isdigit():
+                self.c_afk_dur_map[_k.strip()] = int(_v)
+        self.c_refuse_words = [str(x).strip() for x in (g("miss_afk_refuse_words") or []) if str(x).strip()]
+        self.c_bye_words = [str(x).strip() for x in (g("miss_afk_bye_words") or []) if str(x).strip()]
+        self.tpl_afk_check = str(g("dm_afk_check_template") or DEFAULTS["dm_afk_check_template"])
+        self.c_reunion_on = bool(g("dm_reunion_on"))
+        self.c_sulk_on = bool(g("dm_sulk_on"))
         self.c_quiet_mode = str(g("miss_quiet_mode") or "auto").strip().lower()
         if self.c_quiet_mode not in ("auto", "manual"):
             self.c_quiet_mode = "auto"
@@ -957,6 +1006,32 @@ class DafeiyuDmPlugin(Star):
 
     # ---------- v1.5 被动侧：全消息监听记账（静默钟/热度/反馈/熔断/抑制/存稿） ----------
 
+    @filter.on_llm_request()
+    async def on_llm_request_dm(self, event: AstrMessageEvent, req=None):
+        """v2.3.0 被动侧事实注入（重逢/小委屈一次性；与 merge 插件注入共存）"""
+        try:
+            if req is None:
+                return
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+            if ":FriendMessage:" not in umo:
+                return
+            now = time.time()
+            blocks = []
+            s = self._sess(umo)
+            if s.get("_reunion_due"):
+                blocks.append(self._reunion_block(umo, now))
+                s["_reunion_due"] = False
+            if s.get("sulk_due") and now >= float(s.get("sulk_due") or 0):
+                s["sulk_due"] = None
+                if s.get("sulk"):
+                    blocks.append(self._sulk_block(umo, now))
+            if blocks:
+                from astrbot.core.agent.message import TextPart as _TP
+                req.extra_user_content_parts.append(_TP(text="".join(blocks)).mark_as_temp())
+                self._save_state()
+        except Exception:
+            pass  # 表达层失败绝不影响回复
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_any_message(self, event: AstrMessageEvent):
         """只记账不动消息（任何异常静默放行）。群消息 v1.5 忽略（群信号是 v1.5.1）。"""
@@ -986,7 +1061,22 @@ class DafeiyuDmPlugin(Star):
             opener = who == "user" and (now - prev_act) > 30 * 60  # 隔半小时再开口=开新话题
             s["act_ts"] = now
             s["act_from"] = "user"
-            s["msg_times"] = (s.get("msg_times") or []) + [now]
+            prev_msgs = s.get("msg_times") or []
+            # v2.3.0 重逢检测：隔很久再开口 → 置一次性标志，回复时注入委屈事实
+            if self.c_reunion_on and prev_msgs and (now - float(prev_msgs[-1])) > 48 * 3600:
+                tw = self._st.get("t_warm") or {}
+                if tw.get("t") is not None:
+                    s["t_warm_before"] = tw
+                s["_reunion_due"] = True
+                s["_reunion_gap"] = now - float(prev_msgs[-1])
+            # v2.3.0 promise 履约记录：约定后 6h 内他来了=kept（喂 T 履约率）
+            pl = s.get("promise") or {}
+            if pl.get("word") and 0 < now - float(pl.get("event") or 0) <= 6 * 3600:
+                log = (s.setdefault("promise_log", []) or [])[-10:]
+                log.append({"word": pl["word"], "at": now, "kept": True})
+                s["promise_log"] = log[-10:]
+                s["promise"] = None
+            s["msg_times"] = prev_msgs + [now]
             cut = now - 26 * 3600
             s["msg_times"] = [t for t in s["msg_times"] if t >= cut]
             # 回复反馈懒结算：挂着待观察 → 按延迟给奖励值，Rescorla-Wagner 更新期待值
@@ -1016,11 +1106,23 @@ class DafeiyuDmPlugin(Star):
                     s["mute_until"] = 0.0
                     s["mute_openers"] = 0
                     self._dlog({"t": "mute_off", "why": "主动开话2次"})
+            # v2.3.0 回归问候：他回来（任意消息）→ 上一离席锚记学习样本并关闭
+            prev_ck = s.get("afk_check") or {}
+            if prev_ck.get("word") and not prev_ck.get("done") and not prev_ck.get("learned"):
+                gap = now - float(prev_ck.get("event") or 0)
+                if 5 * 60 < gap < 16 * 3600:
+                    self._st.setdefault("afk_dur_learn", {}).setdefault(prev_ck["word"], []).append(round(gap / 60, 1))
+                    lst = self._st["afk_dur_learn"][prev_ck["word"]]
+                    if len(lst) > 10:
+                        self._st["afk_dur_learn"][prev_ck["word"]] = lst[-10:]
+                s["afk_check"] = dict(prev_ck, done=True, learned=True)
             # 离席/约定词：挂在当前静默事件上（事件=act_ts 起算的静默段）
             if self.c_afk_words:
                 hit = next((w for w in self.c_afk_words if w in text), None)
                 if hit:
                     s["afk"] = {"word": hit, "event": now}
+                    s["afk_check"] = {"word": hit, "event": now, "text": text[:80],
+                                      "rounds": self._heat_rounds(umo, now)}
             if self.c_promise_words:
                 hit = next((w for w in self.c_promise_words if w in text), None)
                 if hit:
@@ -1123,7 +1225,7 @@ class DafeiyuDmPlugin(Star):
         if not last:
             return 0
         win_lo = last - self.c_heat_win * 60
-        ts = [t for t in (s.get("msg_times") or []) if win_lo <= t <= last]
+        ts = sorted(t for t in (s.get("msg_times") or []) if win_lo <= t <= last)
         if not ts:
             return 0
         rounds, prev = 1, ts[0]
@@ -1152,8 +1254,33 @@ class DafeiyuDmPlugin(Star):
             return 1.0
         P = self._P(umo)
         tau = P.cd_tau * (0.5 if self._is_free_day() else 1.0)
-        f = 1.0 - P.cd_a * math.exp(-(d - 1) / tau)
-        return 1.0 if f >= 0.97 else round(f, 3)
+        # v2.3.0 深度耦合 V：他回应得好（V 高）她少收着，晾她（V 低）矜持加深——
+        # 复用 RW 期待值不新开学习器；挡位钳位防学习穿底
+        a = P.cd_a
+        if self.c_cd_a_learn:
+            v = float(s.get("exp_v", 0.6))
+            a = min(self.c_cd_a_hi, max(self.c_cd_a_lo,
+                   a * (1.0 + self.c_cd_a_slope * (0.6 - v))))
+        f = 1.0 - a * math.exp(-(d - 1) / tau)
+        if f >= 0.97:
+            return 1.0
+        # v2.3.0 当日噪声：每人每日掷一次（独立存 pdrift.date_noise，防"永远精确 0.35"；
+        # 独立于 _drift_vals 的开关——drift 关着噪声也要在）
+        qq = str(umo.split(":")[-1])
+        today = datetime.now().date().isoformat()
+        ent = (self._st.get("pdrift") or {}).get(qq) or {}
+        noise = float((ent.get("v") or {}).get("date_noise") or 0) \
+            if ent.get("date") == today else 0
+        if not noise:
+            noise = round(random.uniform(0.90, 1.10), 3)
+            ent = dict(ent) if ent.get("date") == today else {"date": today, "on": False, "v": {}}
+            v = dict(ent.get("v") or {})
+            v["date_noise"] = noise
+            ent["v"] = v
+            if not ent.get("date"):
+                ent["date"] = today
+            self._st.setdefault("pdrift", {})[qq] = ent
+        return round(min(1.0, f * float(noise)), 3)
 
     def _heat_factor(self, rounds: int, umo: str = None) -> float:
         """热度饱和曲线（v2.0.0）：f(r)=1+(hot−1)·r/(K+r)，冷场折扣在前 cold_max 轮线性淡出。
@@ -1489,12 +1616,26 @@ class DafeiyuDmPlugin(Star):
         elif self.c_miss_mode == "silence":
             await self._silence_eval(now, phase)
 
+        # ---------- v2.3.0 回归问候（离席到点未归） ----------
+        if self.c_afk_check_on:
+            tmap = self._target_map()
+            for _pid, _qs in (tmap or {}).items():
+                for _qq in _qs:
+                    await self._afk_check_eval(f"{_pid}:FriendMessage:{_qq}", now, phase)
+
         # ---------- 懒结算：待观察超 12h 按没回处理 ----------
         for umo, s in (self._st.get("sess") or {}).items():
             pr = s.get("pending_reply")
             if pr and now - float(pr.get("sent_at") or 0) > self.c_reply_slow * 60:
                 s["pending_reply"] = None
                 self._rw_update(umo, self._P(umo).rw_r_none)
+            # v2.3.0 promise 未赴：约定超 6h 没兑现且他没来 → kept=False（喂 T 履约率）
+            _pl = (s.get("promise") or {})
+            if _pl.get("word") and now - float(_pl.get("event") or 0) > 6 * 3600:
+                _lg = (s.setdefault("promise_log", []) or [])[-10:]
+                _lg.append({"word": _pl["word"], "at": float(_pl.get("event") or 0), "kept": False})
+                s["promise_log"] = _lg[-10:]
+                s["promise"] = None
         self._save_state()
 
     def _night_bed_from_state(self, st: dict, now: float) -> float:
@@ -1688,6 +1829,13 @@ class DafeiyuDmPlugin(Star):
             parts.append(f"沉默前 {span} 分钟里TA来了 {rounds} 轮{hot}" if span else f"窗口内TA来了 {rounds} 轮{hot}")
         v = float(s.get("exp_v", 0.6))
         parts.append(days_line + f"；TA近来的回应热情（期待值 {v:.2f}，乘子 {self._rw_factor(umo):.2f}）")
+        # v2.3.0 生成端 T 事实：关系温度三档（措辞自然带温度；概率侧另有接入）
+        tw = self._st.get("t_warm") or {}
+        tw_ts = float(tw.get("ts") or 0)
+        if tw_ts and time.time() - tw_ts < 6 * 3600:
+            tv = float(tw.get("t") or 0.5)
+            mood_w = "热乎" if tv > 0.65 else ("有点淡" if tv < 0.35 else "平常")
+            parts.append(f"最近你们聊得{mood_w}")
         parts.append(f"今日已主动 {int(self._st.get('sent_total', 0))} 条；现在 {datetime.now().strftime('%H:%M')}")
         return "[背景事实：" + "；".join(parts) + "]\n"
 
@@ -1698,8 +1846,321 @@ class DafeiyuDmPlugin(Star):
         if not last:
             return 0
         win_lo = last - self.c_heat_win * 60
-        ts = [t for t in (s.get("msg_times") or []) if win_lo <= t <= last]
+        ts = sorted(t for t in (s.get("msg_times") or []) if win_lo <= t <= last)
         return int((ts[-1] - ts[0]) // 60) if len(ts) >= 2 else 0
+
+    # ---------- v2.3.0 感情温度 T（长期关系面；快照/趋势/V/T 四张脸防重账总纲） ----------
+
+    @staticmethod
+    def _sat(x: float) -> float:
+        """比值→[0,1] 饱和映射：≥1.5→1.0、≤0.3→0.0 线性夹中间（跟自己基线比）"""
+        return min(1.0, max(0.0, (x - 0.3) / 1.2))
+
+    def _warm_t(self, umo: str) -> float:
+        """T=0.4×轮数趋势+0.3×联系频率+0.3×约定履约率（各路缺数据按 0.5）。
+        开窗/开注入时算一次存 t_warm；msg_times 只存 26h，不足 14 天就有什么用什么——
+        信号面变窄但方向仍对（新关系冷启动由缺路回 0.5 兜）"""
+        s = self._sess(umo)
+        now = time.time()
+        ts = [float(x) for x in (s.get("msg_times") or []) if float(x) > 0]
+        r_rounds = r_freq = keep = None
+        if len(ts) >= 4:
+            cut14 = now - 14 * 86400
+            base_ts = sorted(x for x in ts if x >= cut14)
+            if len(base_ts) >= 4:
+                # 联系频率：近7天日均 ÷ 14天日均
+                cut7 = now - 7 * 86400
+                n7 = len([x for x in base_ts if x >= cut7])
+                days7 = max(1.0, (now - cut7) / 86400) if base_ts[-1] < cut7 else max(
+                    1.0, min(7.0, (now - base_ts[0]) / 86400))
+                span_all = max(1.0, min(14.0, (now - base_ts[0]) / 86400))
+                freq7, freq_all = n7 / days7, len(base_ts) / span_all
+                if freq_all > 0:
+                    r_freq = self._sat(freq7 / freq_all)
+                # 轮数趋势：近7天每场轮数中位 ÷ 14天每场轮数中位（burst_gap 聚合）
+                def _rounds_med(lo_t):
+                    win = [x for x in base_ts if x >= lo_t]
+                    if len(win) < 2:
+                        return None
+                    ses, prev = [], win[0]
+                    cnt = 1
+                    for x in win[1:]:
+                        if x - prev > self.c_burst_gap:
+                            ses.append(cnt); cnt = 1
+                        else:
+                            cnt += 1
+                        prev = x
+                    ses.append(cnt)
+                    ses.sort()
+                    return ses[len(ses) // 2]
+                m7, m_all = _rounds_med(cut7), _rounds_med(cut14)
+                if m7 and m_all:
+                    r_rounds = self._sat(m7 / m_all)
+        # 约定履约率：最近 10 次 promise 锚实际回来占比（回来=promise 后 6h 内有他消息）
+        log = (s.get("promise_log") or [])[-10:]
+        if len(log) >= 3:
+            keep = sum(1 for e in log if e.get("kept")) / len(log)
+        t = (0.4 * (0.5 if r_rounds is None else r_rounds)
+             + 0.3 * (0.5 if r_freq is None else r_freq)
+             + 0.3 * (0.5 if keep is None else keep))
+        t = round(min(1.0, max(0.0, t)), 3)
+        self._st["t_warm"] = {"rounds": r_rounds, "freq": r_freq, "keep": keep, "t": t,
+                              "ts": time.time(), "at": datetime.now().strftime("%m-%d %H:%M")}
+        return t
+
+    # ---------- v2.3.0 回归问候 ----------
+
+    def _afk_dur_learn_min(self, word: str) -> float:
+        """该词的预期时长（分钟）：学习表 n≥3 用中位数（偶数取中间均值），否则先验；配置覆盖最优先"""
+        if word in self.c_afk_dur_map:
+            return float(self.c_afk_dur_map[word])
+        ent = ((self._st.get("afk_dur_learn") or {}).get(word)) or []
+        ent = sorted(float(x) for x in ent if float(x) > 0)
+        if len(ent) >= 3:
+            n = len(ent)
+            return (ent[n // 2] if n % 2 else (ent[n // 2 - 1] + ent[n // 2]) / 2.0)
+        return float(AFK_DUR_PRIOR.get(word, 90))
+
+    def _afk_check_anchor(self, umo: str, now: float):
+        """离席锚是否应开回归窗：锚有效、窗已到点、窗未过宽、他没再说话。
+        返回 (锚dict, intent, 窗开始时刻) 或 None"""
+        s = self._sess(umo)
+        a = s.get("afk_check") or {}
+        if not a.get("word") or a.get("done"):
+            return None
+        ev = float(a.get("event") or 0)
+        if not ev or float(s.get("act_ts") or 0) > ev:
+            return None  # 他已回来（说过话），窗作废
+        win_start = float(a.get("win_at") or 0)
+        if not win_start:
+            dur = self._afk_dur_learn_min(a["word"]) * 60
+            win_start = ev + dur + random.uniform(15, 45) * 60
+            # 夜间不开窗：窗起点落在 23:30~08:00 顺延到次日 09:00（免深夜追问）
+            ws_dt = datetime.fromtimestamp(win_start)
+            m = ws_dt.hour * 60 + ws_dt.minute
+            if m >= 23 * 60 + 30 or m < 8 * 60:
+                nxt = ws_dt.replace(hour=9, minute=0, second=0, microsecond=0)
+                if m >= 23 * 60 + 30:
+                    nxt = nxt + timedelta(days=1)
+                win_start = nxt.timestamp()
+            a["win_at"] = win_start
+            a["f_intent"] = None  # 池值开窗时掷、窗内锁定
+            self._save_state()
+        if now < win_start or now > win_start + AFK_CHECK_WIN_MIN * 60:
+            if now > win_start + AFK_CHECK_WIN_MIN * 60:
+                a["done"] = True  # 窗过了没掷中：此锚翻篇，不追问第二遍
+                self._save_state()
+            return None
+        return a
+
+    def _afk_intent(self, umo: str, a: dict):
+        """意图分层（优先级 拒绝>约定>告别>普通）。返回 (intent, f值或None)；拒绝返回 (None,0)"""
+        s = self._sess(umo)
+        now = time.time()
+        # 拒绝词：锚消息原文或其后 5min 内他的消息命中 → 本窗不开
+        if self.c_refuse_words:
+            said = str(a.get("text") or "")
+            for w in self.c_refuse_words:
+                if w in said:
+                    return "refuse", 0.0
+            mute_ts = float(s.get("mute_until") or 0)
+            if mute_ts > now:
+                return "refuse", 0.0  # 显式抑制期同样不开窗
+        promise = s.get("promise") or {}
+        has_promise = bool(promise.get("word")) and 0 <= float(promise.get("event") or -1) <= float(a.get("win_at") or 0)
+        bye = any(w in str(a.get("text") or "") for w in self.c_bye_words)
+        tw = self._st.get("t_warm") or {}
+        T = float(tw.get("t") or 0.5) if float(tw.get("ts") or 0) > time.time() - 6 * 3600 else self._warm_t(umo)
+        if has_promise:
+            f = random.uniform(*INTENT_POOL_PROMISE)
+            return "promise", round(f, 3)
+        c = min(0.35 + 0.5 * T, 0.7) if bye else 0.55 + 0.3 * T
+        if bye:
+            c = min(c, 0.7)
+        lo, hi = max(0.05, c - 0.1), min(0.95, c + 0.1)
+        return ("bye" if bye else "plain"), round(random.uniform(lo, hi), 3)
+
+    @staticmethod
+    def _lognorm_hazard_p(el_min: float) -> float:
+        """对数正态 hazard 形状因子（0~1）：峰在 PEAK_MIN、σ=SIGMA。
+        先升（该回来了怎么还没冒头）后降（再不来心就凉）——直接用密度比 φ(z)/φ(z_peak)，
+        危险率的"先升后降"形状由密度主导（峰后 φ 衰减快于 1/t），数值稳定"""
+        if el_min <= 0.5:
+            return 0.0
+        mu = math.log(AFK_CHECK_PEAK_MIN)  # 密度峰位 ln(t*)=mu（hazard 峰略右移，形状足够）
+        z = (math.log(el_min) - mu) / AFK_CHECK_SIGMA
+        zm = 0.0
+        pdf = math.exp(-0.5 * z * z)
+        pdfm = math.exp(-0.5 * zm * zm)
+        return max(0.0, min(1.0, pdf / pdfm))
+
+    def _afk_check_eval(self, umo: str, now: float, phase: str):
+        """回归窗内逐 tick 掷（挂在 _silence_eval 之后调用）"""
+        if not self.c_afk_check_on:
+            return
+        try:
+            if phase != "awake" or not self._in_quiet(now):
+                return
+            s = self._sess(umo)
+            a = self._afk_check_anchor(umo, now)
+            if not a:
+                return
+            # 互斥：本事件已 miss 发过 → 跳过；dice done 的事件也跳
+            d = s.get("dice") or {}
+            if d.get("done") or (d.get("rolled") and float(d.get("event") or 0) == float(s.get("act_ts") or -1)):
+                a["done"] = True
+                self._save_state()
+                return
+            if a.get("f_intent") is None:
+                intent, f = self._afk_intent(umo, a)
+                if intent == "refuse":
+                    a["done"] = True
+                    a["f_intent"] = 0.0
+                    a["intent"] = "refuse"
+                    self._dlog({"t": "afk_check_void", "why": "refuse"})
+                    self._save_state()
+                    return
+                a["intent"], a["f_intent"] = intent, f
+                self._save_state()
+            intent, f = a.get("intent"), float(a.get("f_intent") or 0)
+            T = float((self._st.get("t_warm") or {}).get("t") or 0.5)
+            P = self._P(umo)
+            drift = self._drift_vals(umo)
+            base = float(drift.get("base", P.base_p))
+            f_reply = self._rw_factor(umo)
+            heat_r = int(a.get("rounds") or 0)
+            f_heat = self._heat_factor(heat_r, umo)
+            mood = float(self._st.get("mood", 1.0))
+            p_cum = min(0.80, max(0.15, base * f_reply * f_heat * mood * f))
+            # 逐 tick：P 按形状因子摊（90min/30s=180 tick；形状峰≈1 时 tick p≈P/90）
+            el_min = (now - float(a.get("win_at") or now)) / 60.0
+            shape = self._lognorm_hazard_p(el_min)
+            p_tick = p_cum * shape / 90.0 * 1.5  # 峰值 tick 附近合计≈P（形状积分≈60）
+            if random.random() >= p_tick:
+                return
+            peak_ts = datetime.fromtimestamp(float(a.get("win_at")) + AFK_CHECK_PEAK_MIN * 60).strftime("%H:%M")
+            self._dlog({"t": "afk_check_roll", "word": a.get("word"), "p_cum": round(p_cum, 3),
+                        "peak_ts": peak_ts, "intent": intent, "f_intent": f, "warm": T})
+            a["done"] = True
+            s["dice"] = {"event": float(s.get("act_ts") or 0), "rolled": True,
+                         "done": True, "n": 1, "max_n": 1}
+            self._save_state()
+            # 发送走既有 fire 通道（模板生成），不发 repeated 追问
+            self._st.setdefault("_afk_fire", {})[umo] = {"word": a.get("word"), "intent": intent}
+            import asyncio
+            asyncio.ensure_future(self._afk_check_fire(umo))
+        except Exception:
+            logger.warning("[主动私聊] 回归问候评估异常（跳过本轮）", exc_info=True)
+
+    async def _afk_check_fire(self, umo: str):
+        try:
+            info = (self._st.get("_afk_fire") or {}).pop(umo, None)
+            if not info:
+                return
+            now = time.time()
+            if not self._quota_ok(now, umo):
+                return
+            tpl = self.tpl_afk_check.replace("{afk_word}", str(info.get("word") or ""))
+            if await self._fire("afk_check", tpl, only_qq=str(umo.split(":")[-1])):
+                self._st["random_sent"] = int(self._st.get("random_sent", 0)) + 1
+        except Exception:
+            logger.warning("[主动私聊] 回归问候发送异常", exc_info=True)
+
+    # ---------- v2.3.0 重逢委屈 / 被晾小委屈（表达层：一次性事实注入，不碰概率） ----------
+
+    def _reunion_block(self, umo: str, now: float) -> str:
+        """重逢委屈事实块：他特别久没来突然回来。时机=人类时间常数（7~10天封顶），
+        强度随 T_before；无历史 fail-open 返回空"""
+        try:
+            if not self.c_reunion_on:
+                return ""
+            s = self._sess(umo)
+            ts = [float(x) for x in (s.get("msg_times") or []) if float(x) > 0]
+            if len(ts) < 2:
+                return ""  # 无历史不委屈
+            gap = float(s.get("_reunion_gap") or 0) or (now - ts[-1])
+            # E_eff：消息间隔中位（跟自己基线比，钳 6h~36h）
+            ivs = sorted(b - a for a, b in zip(ts, ts[1:]) if 0 < b - a < 14 * 86400)
+            if not ivs:
+                return ""
+            e_med = ivs[len(ivs) // 2]
+            e_eff = min(REUNION_E_HI, max(REUNION_E_LO, e_med))
+            tier_i = 0
+            for i, (k, lo, hi) in enumerate(REUNION_TIERS):
+                if gap >= min(k * e_eff, lo):
+                    tier_i = i + 1
+            if not tier_i:
+                return ""
+            tier_names = ("轻哼一声", "明显委屈", "大委屈/闹别扭")
+            # 被晾证据：期间她的主动（dlog miss/night/morning sent）没回
+            ignored = int(s.get("unans") or 0)
+            since = datetime.fromtimestamp(ts[-1]).strftime("%m-%d %H:%M")
+            ratio = round(gap / e_eff, 1)
+            days = round(gap / 86400, 1)
+            t_before = float((s.get("t_warm_before") or {}).get("t") or 0.5)
+            if t_before < 0.35:
+                flavor = "你们最近本来就有点淡，你不必闹，淡淡的就好"
+            elif tier_i == 3:
+                flavor = "你攒了很久的委屈，这下全有了由头"
+            else:
+                flavor = "你有点小情绪"
+            lines = [f"距TA上一条消息（{since}）已 {days} 天——你们平常平均 {round(e_eff/3600,1)} 小时一聊，这次隔了 {ratio} 倍"]
+            if ignored > 0:
+                lines.append(f"这期间你主动找过TA {ignored} 次，TA都没回")
+            lines.append(f"TA现在回来了。此刻你的状态：{tier_names[tier_i-1]}（{flavor}）。反应按你们的关系和你的性格来，别提系统")
+            self._dlog({"t": "reunion", "gap_days": days, "ratio": ratio,
+                        "tier": tier_i, "t_before": t_before, "ignored_n": ignored})
+            return "[重逢事实：" + "；".join(lines) + "]\n"
+        except Exception:
+            return ""
+
+    def _sulk_block(self, umo: str, now: float) -> str:
+        """被晾小委屈事实块：她找了他、他晾着她（小时级）。他开口时一次性注入"""
+        try:
+            if not self.c_sulk_on:
+                return ""
+            s = self._sess(umo)
+            sk = s.get("sulk") or {}
+            if not sk.get("sent_at"):
+                return ""
+            if now - float(sk.get("sent_at") or 0) > SULK_VALID_H * 3600:
+                s["sulk"] = None
+                s["sulk_due"] = None
+                return ""
+            wait_h = round((now - float(sk.get("sent_at") or 0)) / 3600, 1)
+            promise = "，你明明说过「%s」" % sk["promise_word"] if sk.get("promise_word") else ""
+            sent_at = datetime.fromtimestamp(float(sk.get("sent_at") or 0)).strftime("%H:%M")
+            self._dlog({"t": "sulk", "wait_h": wait_h, "promise": bool(sk.get("promise_word")),
+                        "thr_h": sk.get("thr_h")})
+            s["sulk"] = None  # 一次性
+            return ("[小委屈事实：你 %s 主动找过TA%s，TA隔了 %s 小时到现在才回——"
+                    "你有点被晾着的小情绪，哼一句就行，反应按你们的相处来，别提系统]\n"
+                    % (sent_at, promise, wait_h))
+        except Exception:
+            return ""
+
+    def _sulk_arm(self, umo: str, sent_at: float):
+        """她的主动发出后布防小委屈（阈值按热度投掷；夜间+8h）。
+        热度=发送前那场对话的轮数（act_ts 是她发出前的最后事件）"""
+        try:
+            if not self.c_sulk_on:
+                return
+            s = self._sess(umo)
+            last = float(s.get("act_ts") or sent_at)
+            rounds = self._heat_rounds(umo, last)
+            hot_n = min(1.0, rounds / max(1, self.c_heat_hot_min))
+            thr_h = (SULK_THR_BASE_H - SULK_THR_SPAN_H * hot_n) * random.uniform(0.75, 1.25)
+            thr_h = min(SULK_THR_CLAMP[1], max(SULK_THR_CLAMP[0], thr_h))
+            dt = datetime.fromtimestamp(sent_at)
+            if dt.hour >= 22 or dt.hour < 9:
+                thr_h += SULK_NIGHT_ADD_H
+            pr = s.get("pending_reply") or {}
+            s["sulk"] = {"sent_at": sent_at, "thr_h": round(thr_h, 2),
+                         "promise_word": (s.get("promise") or {}).get("word") or "",
+                         "rounds": rounds}
+            s["sulk_due"] = sent_at + thr_h * 3600
+        except Exception:
+            pass
 
     def _stance_line(self, umo: str) -> str:
         """判断心态段（v2.1.0）：QQ 映射 > 配置文件映射(含前缀/default) > 全局心态键。
@@ -2069,6 +2530,7 @@ class DafeiyuDmPlugin(Star):
                     # R7：带工具的轮次把工具轨迹拼进归档——否则后续上下文里
                     # "她不知道自己刚发过那张图/那首歌"，容易穿帮。
                     # 注记从紧：至多3条、每条结果截25字（归档无硬上限，省的是上下文token）
+                    self._sulk_arm(umo, now)
                     archive_text = text
                     if self._tool_trace:
                         archive_text = (
