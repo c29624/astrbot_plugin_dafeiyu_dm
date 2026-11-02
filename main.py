@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.2.1"
+PLUGIN_VERSION = "2.2.2"
 DM_PERSONA_SLICE = 2600  # v2.2.0：人设切片上限（旧1500装不下"唯一的"的说话规则段；主动消息日均≤7条，token 代价可忽略）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -518,7 +518,7 @@ class DafeiyuDmPlugin(Star):
         if self.c_tier_per_conf and self._tier_map:
             logger.info(f"[主动私聊] 挡位按配置文件/QQ区分已开：{sorted(self._tier_map.values())}"
                         f"（{len(self._tier_map)} 条映射）")
-        self._conf_pid_cache = {}
+        self._conf_umo_cache = {}
         self._p_cache = {}
         self._p_global = self._build_p_global()
         self.tpl_miss_random = str(g("dm_miss_random_template") or DEFAULTS["dm_miss_random_template"])
@@ -630,23 +630,36 @@ class DafeiyuDmPlugin(Star):
         return t or self.c_temperament
 
     def _conf_of(self, umo: str) -> str:
-        """umo → 配置文件ID：配置的 platform 列表里含该平台 → 该配置；找不到=default"""
+        """umo → 配置文件ID。v2.2.2 优先官方 umop 路由表（核心 get_conf 同源、按会话绑定）；
+        拿不到再按 platform 列表兜底猜（旧版核心/无绑定时）。旧版只按 platform 猜：
+        多配置按会话分绑时（如两个好友各一份配置）会全部读到绑平台的那一份——挡位/
+        心态段跟着读错对象（11-02 排查：296/507 各绑一份，双方都解析到 507 那份）"""
+        if umo in self._conf_umo_cache:
+            return self._conf_umo_cache[umo]
         pid = str(umo.split(":")[0])
-        if pid in self._conf_pid_cache:
-            return self._conf_pid_cache[pid]
         cid = "default"
         try:
-            confs = getattr(self.context.astrbot_config_mgr, "confs", {}) or {}
-            for kid, conf in (confs.items() if hasattr(confs, "items") else []):
-                for p in (conf.get("platform") or []):
-                    if isinstance(p, dict) and str(p.get("id")) == pid:
-                        cid = str(kid)
-                        break
-                if cid != "default":
-                    break
+            mgr = getattr(self.context, "astrbot_config_mgr", None)
+            info = mgr.get_conf_info(umo) if mgr else None
+            if info:
+                got = str(info.get("id") or "")
+                if got and got != "default":
+                    cid = got
         except Exception:
             pass
-        self._conf_pid_cache[pid] = cid
+        if cid == "default":
+            try:
+                confs = getattr(self.context.astrbot_config_mgr, "confs", {}) or {}
+                for kid, conf in (confs.items() if hasattr(confs, "items") else []):
+                    for p in (conf.get("platform") or []):
+                        if isinstance(p, dict) and str(p.get("id")) == pid:
+                            cid = str(kid)
+                            break
+                    if cid:
+                        break
+            except Exception:
+                pass
+        self._conf_umo_cache[umo] = cid
         return cid
 
     def _drift_vals(self, umo: str) -> dict:
