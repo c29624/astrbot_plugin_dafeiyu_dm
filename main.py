@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.3.0"
+PLUGIN_VERSION = "2.3.1"
 DM_PERSONA_SLICE = 2600  # v2.2.0：人设切片上限（旧1500装不下"唯一的"的说话规则段；主动消息日均≤7条，token 代价可忽略）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -1255,12 +1255,17 @@ class DafeiyuDmPlugin(Star):
         P = self._P(umo)
         tau = P.cd_tau * (0.5 if self._is_free_day() else 1.0)
         # v2.3.0 深度耦合 V：他回应得好（V 高）她少收着，晾她（V 低）矜持加深——
-        # 复用 RW 期待值不新开学习器；挡位钳位防学习穿底
+        # 复用 RW 期待值不新开学习器；挡位钳位防学习穿底。
+        # v2.3.1 关系底色微调（T）：热恋期被晾一次不会立刻收深（底子厚），冷淡期
+        # 同样的冷落分量更重（底子薄）——斜率 0.15=V 的 15%，事件反馈仍主导，
+        # T 只垫底色（偏离中心最多 ±7.5%），不翻转任何方向
         a = P.cd_a
         if self.c_cd_a_learn:
             v = float(s.get("exp_v", 0.6))
+            tw = self._st.get("t_warm") or {}
+            t_rel = float(tw.get("t") or 0.5) if float(tw.get("ts") or 0) > time.time() - 6 * 3600 else 0.5
             a = min(self.c_cd_a_hi, max(self.c_cd_a_lo,
-                   a * (1.0 + self.c_cd_a_slope * (0.6 - v))))
+                   a * (1.0 + self.c_cd_a_slope * (0.6 - v)) * (1.0 + 0.15 * (0.5 - t_rel))))
         f = 1.0 - a * math.exp(-(d - 1) / tau)
         if f >= 0.97:
             return 1.0
