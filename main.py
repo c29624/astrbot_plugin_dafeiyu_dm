@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.3.3"
+PLUGIN_VERSION = "2.4.0"
 DM_PERSONA_SLICE = 2600  # v2.2.0：人设切片上限（旧1500装不下"唯一的"的说话规则段；主动消息日均≤7条，token 代价可忽略）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -195,6 +195,7 @@ DEFAULTS = {
     ),
     "dm_reunion_on": True,            # 重逢委屈（生成侧事实注入）
     "dm_sulk_on": True,               # 被晾小委屈（生成侧事实注入）
+    "dm_preset_apply": "",            # v2.4.0 用途预设：companion/balanced/tool，应用后自动清空
     "miss_quiet_mode": "auto",        # auto=跟睡眠作息 / manual=用手动时段
     "miss_quiet_start": "10:00",
     "miss_quiet_end": "22:30",
@@ -278,6 +279,49 @@ _TEMPERAMENTS = {
 # 旧挡位名迁移：淡泊/黏人是用户主动选过的性格→映射新名保留意图；标准是旧默认→转自定义，保住手动调过的数值
 _TEMPERAMENT_MIGRATE = {"淡泊": "平淡", "标准": "自定义", "黏人": "热情"}
 # 自定义挡位槽可写的参数键 → (c_属性/None=基线, 下限, 上限, 类型)；值按同款夹取范围收口
+# ---------- v2.4.0 用途预设包（两下拉一步到位：用途在此选，性格用 miss_temperament） ----------
+
+ORIENT_PRESETS = {
+    "companion": {  # 情感陪伴型：全情感栈开
+        "dm_miss_mode": "silence", "dm_morning_on": True, "dm_night_on": True,
+        "miss_afk_check_on": True, "dm_reunion_on": True, "dm_sulk_on": True,
+        "dm_two_stage": True,
+        "dm_with_context": True, "dm_memory_on": True, "dm_seg_enabled": True,
+        "dm_respect_sleep": True,
+    },
+    "balanced": {   # 均衡型：现状缺省（想念走概率、委屈开、追问 opt-in）
+        "dm_miss_mode": "silence", "dm_morning_on": True, "dm_night_on": True,
+        "miss_afk_check_on": False, "dm_reunion_on": True, "dm_sulk_on": True,
+        "dm_two_stage": True,
+        "dm_with_context": True, "dm_memory_on": True, "dm_seg_enabled": True,
+        "dm_respect_sleep": True,
+    },
+    "tool": {       # 工具助理型：timer 定时 + 全情感栈关（助理不委屈）
+        "dm_miss_mode": "timer", "dm_morning_on": False, "dm_night_on": False,
+        "miss_afk_check_on": False, "dm_reunion_on": False, "dm_sulk_on": False,
+        "dm_two_stage": False,
+        "dm_with_context": True, "dm_memory_on": True, "dm_seg_enabled": True,
+        "dm_respect_sleep": True,
+    },
+}
+
+# 提示词族=拼装：3 用途骨架 + 4 性格语气层（组合出 12 种独立成文；中性公共文案）
+STANCE_SKELETON = {
+    "companion": "你们是彼此亲近的人。主动开口不需要理由，惦记本身就是常态；语气带着你们相处的生活感。",
+    "balanced": "你们关系不错。主动开口自然就好，该说事说事，该关心关心，不用端着。",
+    "tool": "你是TA的助理。主动消息以把事说清楚为先：简洁、直接、信息完整，不需要寒暄和情绪铺垫。",
+}
+STANCE_TONE = {
+    "平淡": "你的性子淡淡的：话少，不主动煽情，关心藏在简短里。",
+    "正常": "你的性子平平常常：该热络热络，该收就收，自然。",
+    "热情": "你的性子热络：话带着劲，关心挂在嘴上，藏不住。",
+    "病娇": "你的性子又黏又独：想起TA就坐不住，话里带着点占有欲和小情绪。",
+}
+TOOL_RANDOM_TPL = (
+    "到点了，把该说的事说清楚：一句话交代事项本身，需要TA做什么直接写，"
+    "不要寒暄铺垫，不要情绪描写。就一两句。"
+)
+
 _CUSTOM_KEYS = {
     "miss_base_p": ("c_base_p", 0.05, 1.0, float),
     "miss_daily_max": ("c_daily_max", 1, 5, int),
@@ -336,7 +380,27 @@ def _clamp_lo_hi(lo: int, hi: int) -> tuple:
 class DafeiyuDmPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
-        cfg = self._flatten(config or {})
+        self._cfg_obj = config
+        # v2.4.0 用途预设：选了未应用的包 → 就地改写 config 原文（后续读取自然生效），
+        # 选择器清空 + 存盘（stance_gen 同款一次性模式）。性格语气层拼进全局心态段
+        _raw = config or {}
+        _flat0 = self._flatten(_raw)
+        _preset = str(_flat0.get("dm_preset_apply") or "").strip()
+        if _preset in ORIENT_PRESETS:
+            _apply = dict(ORIENT_PRESETS[_preset])
+            if _preset == "tool":
+                _apply["dm_miss_random_template"] = TOOL_RANDOM_TPL
+            _temper = str(_flat0.get("miss_temperament") or "自定义")
+            _tone = STANCE_TONE.get(_temper, "")
+            if _preset in STANCE_SKELETON:
+                _apply["dm_miss_stance_hint"] = STANCE_SKELETON[_preset] + _tone
+            _apply["dm_preset_apply"] = ""
+            for k, v in _apply.items():
+                self._cfg_write_raw(_raw, k, v)
+            self._preset_dirty = True  # initialize 里存盘
+            cfg = self._flatten(_raw)  # 含预设改写后的读取
+        else:
+            cfg = self._flatten(_raw)
         g = lambda k: cfg.get(k, DEFAULTS[k])
         self.enabled = bool(g("dm_enabled"))
         self.c_targets = [str(t).strip() for t in (g("dm_targets") or []) if str(t).strip()]
@@ -828,6 +892,16 @@ class DafeiyuDmPlugin(Star):
     # ---------- 生命周期 ----------
 
     async def initialize(self):
+        if getattr(self, "_preset_dirty", False):
+            try:
+                await self._cfg_obj.save_config_async()
+                logger.info("[主动私聊] 用途预设已应用并保存")
+            except Exception:
+                try:
+                    self._cfg_obj.save_config()
+                except Exception:
+                    logger.warning("[主动私聊] 预设应用后存盘失败（下次重载再生效）", exc_info=True)
+            self._preset_dirty = False
         try:
             from astrbot.api.star import StarTools
 
@@ -2193,6 +2267,18 @@ class DafeiyuDmPlugin(Star):
         txt = txt.strip()
         return f"[你的判断心态：{txt.replace('{who}', 'TA')}]\n" if txt else ""
 
+    @staticmethod
+    def _cfg_write_raw(cfg: dict, key: str, value) -> bool:
+        """把键写进配置 dict 的所在分组（找不到落顶层）——供预设就地改写用"""
+        if not isinstance(cfg, dict):
+            return False
+        for k, v in cfg.items():
+            if isinstance(v, dict) and key in v:
+                v[key] = value
+                return True
+        cfg[key] = value
+        return True
+
     def _cfg_write(self, key: str, value) -> bool:
         """写回配置对象（先找所在分组，找不到落顶层；_flatten 两种都读得到）"""
         cfg = self._cfg_obj
@@ -3070,6 +3156,83 @@ class DafeiyuDmPlugin(Star):
             except Exception:
                 return False
         return False
+
+    @filter.command("主动私聊保存")
+    async def cmd_save_tier(self, event: AstrMessageEvent, name: str = ""):
+        """把发送者当前生效的挡位参数快照存进自定义槽（第一个空位，最多3个）"""
+        if not self._is_admin(event):
+            yield event.plain_result("没权限")
+            return
+        name = (name or "").strip()
+        if not name:
+            yield event.plain_result("用法：/主动私聊保存 槽名（把当前挡位参数存成自定义挡）")
+            return
+        if name in _TEMPERAMENTS:
+            yield event.plain_result(f"「{name}」是固定挡位名，换个名字")
+            return
+        slots = [str(x) for x in (self._flatten(self._cfg_obj or {}).get("miss_custom_slots") or []) if str(x).strip()]
+        if any(x.split(":", 1)[0].strip() == name for x in slots):
+            yield event.plain_result(f"槽「{name}」已存在（要覆盖先在面板删掉那行）")
+            return
+        line = self._tier_slot_line(event.unified_msg_origin, name)
+        if not line:
+            yield event.plain_result("没取到当前挡位参数（会话无记录？先跟TA说句话再试）")
+            return
+        if len(slots) >= 3:
+            yield event.plain_result("三个自定义槽都满了。手动放：" + chr(10) + line)
+            return
+        slots.append(line)
+        self._cfg_write("miss_custom_slots", slots)
+        try:
+            await self._cfg_obj.save_config_async()
+        except Exception:
+            try:
+                self._cfg_obj.save_config()
+            except Exception:
+                yield event.plain_result("槽行已生成但存盘失败，手动粘贴：" + chr(10) + line)
+                return
+        yield event.plain_result(f"已存为自定义挡「{name}」（槽{len(slots)}/3）。重载后即可在挡位里选用")
+
+    @filter.command("主动私聊导出")
+    async def cmd_export_tier(self, event: AstrMessageEvent):
+        """回显当前挡位的槽行文本（面板复制粘贴用）"""
+        if not self._is_admin(event):
+            yield event.plain_result("没权限")
+            return
+        line = self._tier_slot_line(event.unified_msg_origin)
+        if not line:
+            yield event.plain_result("没取到当前挡位参数")
+            return
+        yield event.plain_result("自定义槽行（复制到面板 miss_custom_slots）：" + chr(10) + line)
+
+    def _tier_slot_line(self, umo: str, name: str = "") -> str:
+        """发送者当前生效挡位 → 自定义槽格式一行（name=用户起的槽名，缺省用当前挡位名）"""
+        try:
+            P = self._P(umo)
+            name = (name or "").strip() or self._tier_of(umo) or "我的挡"
+            gap = "%g-%g" % (P.retry_gap_lo, P.retry_gap_hi)
+            kv = [
+                ("miss_base_p", P.base_p), ("miss_daily_max", P.daily_max),
+                ("dm_daily_cap", P.cap),
+                ("miss_rw_alpha", P.rw_alpha), ("miss_rw_r_fast", P.rw_r_fast),
+                ("miss_rw_r_slow", P.rw_r_slow), ("miss_rw_r_none", P.rw_r_none),
+                ("miss_rw_lo", P.rw_lo), ("miss_rw_hi", P.rw_hi),
+                ("miss_cd_a", P.cd_a), ("miss_cd_tau", P.cd_tau),
+                ("miss_haz_k", getattr(P, "haz_k", 2.0)),
+                ("miss_haz_scale", getattr(P, "haz_scale", 1.0)),
+                ("miss_floor", P.floor), ("miss_retry_tau", P.retry_tau),
+                ("miss_retry_gap", gap),
+                ("miss_heat_cold_factor", P.heat_cold_f), ("miss_heat_hot_factor", P.heat_hot_f),
+                ("miss_heat_k", P.heat_k),
+                ("miss_afk_min", P.afk_min), ("miss_mid_min", P.mid_min),
+                ("miss_silence_min", P.silence_min),
+                ("morning_base", P.morning_base), ("evening_base", P.evening_base),
+            ]
+            body = ", ".join("%s=%s" % (k, ("%g" % v) if isinstance(v, float) else v) for k, v in kv)
+            return name + ": " + body
+        except Exception:
+            logger.warning("[主动私聊] 挡位导出失败", exc_info=True)
+            return ""
 
     @filter.command("主动私聊状态")
     async def cmd_status(self, event: AstrMessageEvent):

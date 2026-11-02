@@ -5,6 +5,19 @@
     "description": "基础（装完就能用：开关都在前几个）",
     "hint": "默认值即推荐组合；想精调概率/曲线往下看各节",
     "items": {
+      "dm_preset_apply": {
+        "description": "用途预设（一键套装）",
+        "hint": "装完第一步：选一个用途包保存重载——情感陪伴型=全情感栈开（静默想念+早晚安+下班了吗+委屈+温度）；均衡型=默认组合（推荐）；工具助理型=定时任务模式、无情感演出（助理不委屈）。会覆盖列出的开关与全局心态段（按人分流的心态条目不动），性格数值不碰——性格用上面的挡位选。用完自动回空",
+        "type": "string",
+        "default": "",
+        "options": [
+          "",
+          "companion",
+          "balanced",
+          "tool"
+        ],
+        "obvious_hint": true
+      },
       "dm_enabled": {
         "description": "总开关",
         "type": "bool",

@@ -229,6 +229,7 @@ https://github.com/c29624/astrbot_plugin_dafeiyu_dm
 30 秒一次的 tick 循环 + 全消息被动监听（记静默钟/热度流水/回复延迟/存稿）。静默评估每 tick 跑：中签 pending 到点过五道门；未中签的按韦布危险率逐 tick 掷骰，没中隔随机几小时按双曲衰减重想（每事件 1~3 次，掷完翻篇）。晨起/睡前按睡觉插件 `wake_at`/`bed_ts` 计划。发送走 `context.send_message(umo)`，内容生成：persona_manager 取现用人设 + provider.text_chat（可挂 tool_loop_agent），超时回落语料池。
 
 ## 更新记录
+- **2.4.0** **用途预设包 + 挡位保存指令（懒人一步到位）**：①**用途预设**（配置最顶 `dm_preset_apply`，选完保存重载自动应用并清空）：**情感陪伴型**=全情感栈开（静默想念+早晚安+下班了吗+委屈+温度事实）；**均衡型**=默认推荐组合；**工具助理型**=定时任务模式（timer）+情感演出全关（两段式内心戏/感官包/委屈/追问都不开，随机模板换任务口吻）——为调工具而来的用户拿到干净的定时执行器。预设只覆盖开关面与全局心态段（**性格数值不碰**，按人分流的心态条目不动）；②**提示词族拼装**：3 用途骨架 × 4 性格语气层组合出 12 种心态段（中性公共文案，应用预设时写入）；③**`/主动私聊保存 <槽名>`**：把当前生效挡位的全部参数一键快照进自定义槽（最多 3 个，重名拒绝、满槽回显不覆盖）；**`/主动私聊导出`**：回显槽行文本供面板复制。配上一版的面板重排：选预设→选性格→不对劲改两个数→`/保存` 定型，全程不用读文档
 - **2.3.3** 补齐回归问候生成侧：发送记 dlog（afk_check_sent 带词与意图档）；生成时接上背景事实块+心态段+第五类情景标签（"离席到点未归"，约定在身时作"·有约在身"）——此前模板干念、她看不到 TA 几点说的词/隔了多久/约定原词
 - **2.3.2** **配置面板懒人优先重排（节内版）**：常用开关提到各自节的**最前面**、说明全部改成人话——基础节（面板第一节）开头就是总开关/性格挡位/上下文/记忆/分段/作息；触发节开头是想念模式/早晚安；概率引擎节开头是"下班了吗"/委屈两开关/词表与基础概率/每日上限，曲线参数沉底。默认值即推荐组合（仅"下班了吗"默认关）。**为什么不建独立"快速上手"节**：实测核心的配置完整性检查按节对账，跨节搬键会把老用户改过的值静默重置成默认（新节插默认、旧节删键）——节内调序安全（仅顺序修复，值不动），老配置零迁移
 - **2.3.1** **冷却深度加关系底色**：v2.3.0 的深度学习只看事件反馈（V=TA这次怎么回应的），同一次被晾在热恋期和冷淡期同价。现在 a_eff 追加 ×(1+0.15×(0.5−T))——关系底色微调：底子厚（T 高）被晾一次不会立刻收深，底子薄（T 低）同样的冷落分量更重。斜率 0.15=V 斜率的 15%（事件反馈仍六倍主导），偏离中心最多 ±7.5%，钳位不变
@@ -326,6 +327,14 @@ https://github.com/c29624/astrbot_plugin_dafeiyu_dm
 - Barabási, *The Origin of Bursts and Heavy Tails in Human Dynamics* (Nature 2005, [arXiv:cond-mat/0505371](https://arxiv.org/abs/cond-mat/0505371))——人类行为等待时间重尾分布：多数动作很快发生、但长延迟后偶尔仍有动作，重想曲线保留长尾（隔很久突然又想一下）的出处
 - Rescorla & Wagner, *A Theory of Pavlovian Conditioning* (1972)——经典强化学习模型 ΔV=α(r−V)：预测误差驱动、渐近收敛的学习律，计算精神病学拿它量化"期待被现实校准"——期待值乘子的出处：她的热情不是配置写死的折扣，是被你的每次回应平滑教出来的
 - Weibull (1951) / Cox, *Regression Models and Life-Tables* (1972, [JSTOR 2985181](https://www.jstor.org/stable/2985181))——生存分析的危险率框架：事件"何时发生"用 λ(t) 逐刻条件概率刻画，Weibull 族 k>1 时随时间加速——触发层逐 30 秒按 λ(t)=k(t/T)^(k−1)/T 掷骰的出处（越拖越坐不住，中签时刻连续散布而非到点一锤定音）
+- Amsel & Roussel, *Motivational properties of frustration: I.* (J. Exp. Psychol. 43(5), 1952, [PubMed 14946348](https://pubmed.ncbi.nlm.nih.gov/14946348))——挫折效应：期望的奖励没按时到，发起行为反而短暂增强（双跑道实验里无奖励后跑得更快）——回归问候"该回来了怎么还没冒头"先升后降曲线的放大侧出处
+- Lerman & Iwata, *Prevalence of the Extinction Burst and its Attenuation During Treatment* (JABA 1995, [PMC1279794](https://pmc.ncbi.nlm.nih.gov/articles/PMC1279794))；及 Shahan, *A Theory of the Extinction Burst* (Perspect. Behav. Sci. 2022)——期望落空后的行为爆发实测是**少数派**：回归问候峰值幅度的上界约束（放大不超过保守比值）
+- Bowlby, *Attachment and Loss* Vol.1 (1969) / Vol.2 (1973)——依恋与分离：抗议期（protest）先强后弱的趋近节律、依恋对象地位来自角色不来自联系频率——回归问候曲线形状与重逢委屈"时机不随关系冷热漂"的出处
+- Granovetter, *The Strength of Weak Ties* (AJS 78(6), 1973, [DOI 10.1086/225469](https://doi.org/10.1086/225469))——关系强度=时间+情感强度+互诉亲密+互惠的**多信号合成**定义：感情温度 T 的框架血统
+- Gilbert & Karahalios, *Predicting Tie Strength with Social Media* (CHI 2009, [ACM 1518930](https://dl.acm.org/doi/10.1145/1518701.1518930))——用沟通频率/亲密/支持等可观测特征计算 tie strength：T 三信号（轮数趋势/联系频率/履约率）的工程化先例
+- Altman & Taylor, *Social Penetration* (1973)——交换深度=亲密度：轮数趋势作为"关系深浅"可观测代理的方向出处
+- Rempel, Holmes & Zanna, *Trust in Close Relationships* (JPSP 49(1), 1985)——信任=可预测性+可依赖性+信念：约定履约率进温度计的方向出处
+- Freedman et al., *Ghosting and Destiny* (Personal Relationships, 2019, [SAGE](https://journals.sagepub.com/doi/abs/10.1177/0265407517748791))；Leckfor et al., *From Close Others to Strangers: Ghosting as Social Rejection Without Explanation* (JEP: General, 2023)——无解释的沉默即拒绝、其伤害长于明确拒绝：重逢委屈"沉默该被当回事"的出处（时机常数取保守工程值，非论文直接测量）
 - Michaelis & Menten (1913) 饱和动力学——反应速率随底物浓度渐近饱和的经典形式 v=V·r/(K+r)：热度档半饱和轮数 K 的出处（冷启动有坡、上头无悬崖，酶动力学同款曲线拿来做"聊到第几轮开始热"）
 
 ## 许可
