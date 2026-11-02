@@ -90,6 +90,23 @@
         "type": "bool",
         "default": true
       },
+      "dm_memory_on": {
+        "description": "预取长期记忆",
+        "hint": "开=生成主动消息前先按目标会话隔离检索长期记忆（需安装 livingmemory，没装则无效果），把最相关的几条拼进上下文——她主动开口也带着记性；关=不取",
+        "type": "bool",
+        "default": true
+      },
+      "dm_memory_k": {
+        "description": "记忆条数",
+        "hint": "预取的相关记忆条数（1~8）",
+        "type": "int",
+        "default": 3,
+        "slider": {
+          "min": 1,
+          "max": 8,
+          "step": 1
+        }
+      },
       "dm_context_count": {
         "description": "上下文条数",
         "hint": "附带给模型的最近聊天记录条数（3~40）",
@@ -869,7 +886,7 @@
       },
       "dm_tools_morning_names": {
         "description": "晨起·工具白名单",
-        "hint": "留空=全部已激活工具；填工具名=只放行这些。**不知道工具名？群里发 /主动私聊工具 查看**",
+        "hint": "留空=全部已激活工具；填工具名=只放行这些。装了 livingmemory 可加 recall_long_term_memory，主动消息就能自己翻长期记忆。**不知道工具名？群里发 /主动私聊工具 查看**",
         "type": "list",
         "default": []
       },

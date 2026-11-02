@@ -33,7 +33,8 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.1.1"
+PLUGIN_VERSION = "2.2.0"
+DM_PERSONA_SLICE = 2600  # v2.2.0：人设切片上限（旧1500装不下"唯一的"的说话规则段；主动消息日均≤7条，token 代价可忽略）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -66,6 +67,8 @@ DEFAULTS = {
     "dm_active_gate_defer_max": 90,  # 上限——随机顺延让人猜不出她会什么时候来
     "dm_with_context": True,    # 生成时附带该会话最近聊天记录（接话茬）
     "dm_context_count": 10,
+    "dm_memory_on": True,       # v2.2.0：生成前预取长期记忆（livingmemory 按目标会话隔离检索）；没装=自动无效果
+    "dm_memory_k": 3,           # 预取几条
     "dm_respect_sleep": True,
     "dm_morning_on": True,
     "dm_night_on": True,
@@ -332,6 +335,11 @@ class DafeiyuDmPlugin(Star):
         self.c_gate_defer_min = max(1, int(g("dm_active_gate_defer_min") or 25))
         self.c_gate_defer_max = max(self.c_gate_defer_min, int(g("dm_active_gate_defer_max") or 90))
         self.c_ctx_n = max(3, min(40, int(g("dm_context_count") or 10)))
+        self.c_memory_on = bool(g("dm_memory_on"))  # v2.2.0 预取长期记忆
+        try:
+            self.c_memory_k = max(1, min(8, int(g("dm_memory_k") or 3)))
+        except Exception:
+            self.c_memory_k = 3
         self.c_respect_sleep = bool(g("dm_respect_sleep"))
         self.c_morning = bool(g("dm_morning_on"))
         self.c_night = bool(g("dm_night_on"))
@@ -2300,6 +2308,50 @@ class DafeiyuDmPlugin(Star):
         except Exception:
             return []
 
+    def _faces_hint(self) -> str:
+        """v2.2.0：主动消息带上 faces 的风格注入。回复管线由 faces 挂 on_llm_request 自己注，
+        dm 的生成不走那条钩子——这里主动取一次。faces 没装/没开/取不到一律返回空串，零影响。"""
+        try:
+            meta = self.context.get_registered_star("astrbot_plugin_dafeiyu_faces")
+            inst = getattr(meta, "star_cls", None) if meta is not None else None
+            hint = getattr(inst, "_style_hint", None)
+            if callable(hint):
+                text = str(hint() or "").strip()
+                if text:
+                    return text + "\n\n"
+        except Exception:
+            pass
+        return ""
+
+    async def _memory_recall(self, umo: str, ctx: str) -> str:
+        """v2.2.0：主动消息前预取长期记忆（livingmemory）。按目标会话显式隔离检索
+        （各号各翻各的账本），拿最近聊天尾部当查询词；没装/查空/超时一律空串，零影响。"""
+        if not (self.c_memory_on and umo):
+            return ""
+        query = ctx.strip()[-200:]
+        if len(query) < 10:
+            return ""
+        try:
+            meta = self.context.get_registered_star("astrbot_plugin_livingmemory")
+            inst = getattr(meta, "star_cls", None) if meta is not None else None
+            eng = getattr(getattr(inst, "initializer", None), "memory_engine", None)
+            search = getattr(eng, "search_memories", None)
+            if not callable(search):
+                return ""
+            results = await asyncio.wait_for(
+                search(query, k=self.c_memory_k, session_id=umo), timeout=8)
+            lines = []
+            for r in results or []:
+                t = str(getattr(r, "content", "") or "").strip().replace("\n", " ")
+                if t:
+                    lines.append("- " + t[:120])
+            if not lines:
+                return ""
+            return ("[你刚翻了下自己的旧记忆，这几条与现在最相关（参考用，别原文复述）]\n"
+                    + "\n".join(lines) + "\n\n")
+        except Exception:
+            return ""
+
     def _synthetic_event(self, umo: str):
         """构造合成事件（参照框架 CronMessageEvent 的做法）：
         工具 handler 需要 event（读会话/发卡片），dm 是定时器触发没有真事件——
@@ -2334,7 +2386,7 @@ class DafeiyuDmPlugin(Star):
         except Exception:
             provider = self.context.get_using_provider()
         prompt = (
-            (persona_text[:1500] + "\n\n" if persona_text else "")
+            (persona_text[:DM_PERSONA_SLICE] + "\n\n" if persona_text else "")
             + ctx
             + f"[当前时间 {datetime.now().strftime('%H:%M')}]\n\n"
             + self._INNER_TASK.replace("{who}", who)
@@ -2408,7 +2460,9 @@ class DafeiyuDmPlugin(Star):
             if provider is not None:
                 persona_text = ""
                 try:
-                    persona = await self.context.persona_manager.get_default_persona_v3(None)
+                    # v2.2.0：带目标 UMO 取人设——走 UMOP 路由拿到该号的人设（296=唯一的/507=肥鱼(博)），
+                    # 旧写法 None 永远落主配置默认（老版大肥鱼）
+                    persona = await self.context.persona_manager.get_default_persona_v3(umo or None)
                     if isinstance(persona, dict):
                         persona_text = str(persona.get("prompt") or persona.get("system_prompt") or "")
                     elif persona is not None:
@@ -2420,9 +2474,14 @@ class DafeiyuDmPlugin(Star):
                 ctx = await self._recent_history(umo) if umo else ""
                 if veto_ctx:
                     ctx = veto_ctx + ctx  # 状态事实块放在聊天记录前
+                mem_line = await self._memory_recall(umo, ctx)  # v2.2.0：预取长期记忆（隔离按目标会话）
+                if mem_line:
+                    ctx = mem_line + ctx
                 now_line = f"[当前时间 {datetime.now().strftime('%H:%M')}]\n\n"
+                fh = self._faces_hint()  # v2.2.0：faces 风格注入（颜文字/拟声词规则），没装=空串
                 prompt = (
-                    (persona_text[:1500] + "\n\n" if persona_text else "")
+                    (persona_text[:DM_PERSONA_SLICE] + "\n\n" if persona_text else "")
+                    + fh
                     + ctx
                     + now_line
                     + prompt_tpl
@@ -2463,7 +2522,8 @@ class DafeiyuDmPlugin(Star):
                             if inner:
                                 now2 = f"[当前时间 {datetime.now().strftime('%H:%M')}]\n\n"
                                 p2 = (
-                                    (persona_text[:1500] + "\n\n" if persona_text else "")
+                                    (persona_text[:DM_PERSONA_SLICE] + "\n\n" if persona_text else "")
+                                    + fh
                                     + ctx
                                     + now2
                                     + "[你刚才心里想的话（这段不会发出去，"
