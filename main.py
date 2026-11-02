@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.2.0"
+PLUGIN_VERSION = "2.2.1"
 DM_PERSONA_SLICE = 2600  # v2.2.0：人设切片上限（旧1500装不下"唯一的"的说话规则段；主动消息日均≤7条，token 代价可忽略）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -1071,8 +1071,9 @@ class DafeiyuDmPlugin(Star):
     # ---------- v1.5 评估时段：自动跟作息 ----------
 
     def _quiet_window(self) -> tuple:
-        """(lo_min, hi_min) 当日分钟。auto=醒来+1h ~ 今晚入睡-30min（夹硬边界）；
-        sleep 读不到→沿用上次推导缓存→再退手动值"""
+        """(lo_min, hi_min) 当日分钟。auto=醒来+1h ~ 今晚入睡-30min（夹硬边界；
+        床点跨午夜时 hi 落在次日，分钟数+1440 防倒挂）。sleep 读不到→沿用上次
+        推导缓存→再退手动值"""
         if self.c_quiet_mode == "manual":
             return _clamp_lo_hi(self.c_quiet_lo, self.c_quiet_hi)
         st = self._sleep_state()
@@ -1080,13 +1081,18 @@ class DafeiyuDmPlugin(Star):
             wake_ts = float(st.get("wake_at") or 0)
             bed_ts = self._night_bed_from_state(st, time.time())
             if wake_ts and bed_ts and bed_ts > wake_ts:
-                lo = (datetime.fromtimestamp(wake_ts + 3600))
-                hi = (datetime.fromtimestamp(bed_ts - 1800))
-                self._quiet_cache = (lo, hi)
-                return _clamp_lo_hi(lo.hour * 60 + lo.minute, hi.hour * 60 + hi.minute)
+                lo = datetime.fromtimestamp(wake_ts + 3600)
+                hi = datetime.fromtimestamp(bed_ts - 1800)
+                # v2.2.1 修跨午夜倒挂：床点-30min 落到明天（如今晚 00:52 床→00:22）时，
+                # 按当日分钟换算 hi=22 会小于 lo → 被硬边界钳成 30 分钟残窗，
+                # 静默评估全天在"窗外" silently 关死（11-02 全天零掷即此故）
+                lo_min, hi_min = lo.hour * 60 + lo.minute, hi.hour * 60 + hi.minute
+                if hi.date() > lo.date():
+                    hi_min += 1440
+                self._quiet_cache = (lo_min, hi_min)
+                return _clamp_lo_hi(lo_min, hi_min)
         if self._quiet_cache:
-            lo, hi = self._quiet_cache
-            return _clamp_lo_hi(lo.hour * 60 + lo.minute, hi.hour * 60 + hi.minute)
+            return _clamp_lo_hi(*self._quiet_cache)
         return _clamp_lo_hi(self.c_quiet_lo, self.c_quiet_hi)
 
     def _in_quiet(self, now: float = None) -> bool:
