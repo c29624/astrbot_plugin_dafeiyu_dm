@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.3.2"
+PLUGIN_VERSION = "2.3.3"
 DM_PERSONA_SLICE = 2600  # v2.2.0：人设切片上限（旧1500装不下"唯一的"的说话规则段；主动消息日均≤7条，token 代价可忽略）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -2068,6 +2068,8 @@ class DafeiyuDmPlugin(Star):
             tpl = self.tpl_afk_check.replace("{afk_word}", str(info.get("word") or ""))
             if await self._fire("afk_check", tpl, only_qq=str(umo.split(":")[-1])):
                 self._st["random_sent"] = int(self._st.get("random_sent", 0)) + 1
+                self._dlog({"t": "afk_check_sent", "word": info.get("word"),
+                            "intent": info.get("intent")})
         except Exception:
             logger.warning("[主动私聊] 回归问候发送异常", exc_info=True)
 
@@ -2527,7 +2529,18 @@ class DafeiyuDmPlugin(Star):
                         logger.info(f"[主动私聊] {kind} -> {qq}: 用户已先开口，跳过（冲刷已带出晨间内容）")
                         sent_any = True
                         continue
-                text = await self._gen(use_tpl, umo, kind=kind)  # 按目标逐个生成（上下文/工具各不同）
+                _vctx = None
+                if kind == "afk_check":
+                    # v2.3.0 回归问候：生成带上背景事实（TA几点说词/隔了多久/约定原词）
+                    # 与第五类情景标签——不然模板干念、她不知道"按惯例该回来了"是什么
+                    _s = self._sess(umo)
+                    _pl = _s.get("promise") or {}
+                    _hasp = bool(_pl.get("word")) and float(_pl.get("event") or 0) > 0
+                    _tag = "离席到点未归·有约在身" if _hasp else "离席到点未归"
+                    _w = (_s.get("afk_check") or {}).get("word") or "离开"
+                    _vctx = (self._status_ctx(umo) + self._stance_line(umo)
+                             + "[本次情景：" + _tag + "（TA说" + _w + "离开，到该回来的点还没冒头）]" + chr(10))
+                text = await self._gen(use_tpl, umo, kind=kind, veto_ctx=_vctx)  # 按目标逐个生成（上下文/工具各不同）
                 try:
                     await self._send_human(umo, text)
                     sent_any = True
