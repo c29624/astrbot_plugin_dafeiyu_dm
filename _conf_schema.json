@@ -1,18 +1,19 @@
 {
-  "basic": {
+  "quick": {
     "type": "object",
-    "title": "基础",
-    "description": "主动私聊：性格挡位 + 三类触发（各自带开关）",
-    "hint": "懒人第一步：选一个性格挡位，概率/频率数值全自动；往下晨起问候/睡前晚安/静默想你各自带开关，收信对象、称呼、作息联动在这里配",
+    "title": "快速上手",
+    "description": "装完就能用：常用开关都在这，默认已是最省心组合。想精调再往下看各进阶节",
+    "hint": "全部默认值即推荐值；\"下班了吗\"默认关（新增行为，想要再开）",
     "items": {
       "dm_enabled": {
-        "description": "启用插件",
+        "description": "总开关",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "关掉后她不再主动发任何消息（被动回复不受影响）"
       },
       "miss_temperament": {
-        "description": "性格挡位（懒人一键）",
-        "hint": "不想研究参数就选一个挡位，她会接管这些数值：基础概率/期待值学习(学习率·奖励值·乘子区间)/冷却恢复(深度·常数)/触发尺度乘子/热度饱和(冷热限·半饱和轮数)/想你每日上限/每日总量/概率下限/想念半衰期与重想间隔/三档静默尺度/最短间隔/晨起睡前基线。平淡=各聊各的，被晾会慢慢真凉；正常=安全型（=全部默认值）；热情=来得勤，被晾了也热情；病娇=全高：学得慢、被晾不降期待、尺度×0.5 很快就开始想你——重い愛那种黏法，介意打扰勿选。想微调单项→选自定义，所有数值自己填。保险丝（评估时段/熔断/抑制词/硬顶）任何挡位都不动",
+        "description": "她的性格挡位",
+        "hint": "懒人一步到位：平淡/正常/热情/病娇——数值全套跟挡位走；想自己调数值选\"自定义\"（下面的进阶参数才生效）",
         "type": "string",
         "default": "自定义",
         "options": [
@@ -24,6 +25,79 @@
         ],
         "obvious_hint": true
       },
+      "dm_miss_mode": {
+        "description": "随机想念",
+        "hint": "silence=按你们聊天的静默节奏想起你（推荐）；timer=固定时刻抽签；off=不要随机想念",
+        "type": "string",
+        "default": "silence",
+        "options": [
+          "silence",
+          "timer",
+          "off"
+        ]
+      },
+      "dm_morning_on": {
+        "description": "早安",
+        "hint": "她醒来后可能主动道早安（概率由性格挡位定）",
+        "type": "bool",
+        "default": true
+      },
+      "dm_night_on": {
+        "description": "晚安",
+        "hint": "她睡前可能主动道晚安（当晚聊过则必发）",
+        "type": "bool",
+        "default": true
+      },
+      "miss_afk_check_on": {
+        "description": "下班了吗",
+        "hint": "TA说\"上班/吃饭\"离开，到该回来的点还没冒头→她主动问一句。默认关，想要就开",
+        "type": "bool",
+        "default": false
+      },
+      "dm_reunion_on": {
+        "description": "重逢委屈",
+        "hint": "TA消失好几天突然回来，她的回复带点委屈（多委屈看隔了多久和你们的关系）",
+        "type": "bool",
+        "default": true
+      },
+      "dm_sulk_on": {
+        "description": "被晾小委屈",
+        "hint": "她找过TA、TA几小时没回，再开口时她的回复带点小情绪",
+        "type": "bool",
+        "default": true
+      },
+      "dm_with_context": {
+        "description": "带聊天上下文",
+        "hint": "主动消息生成时参考你们最近的对话（关掉=凭空想话题）",
+        "type": "bool",
+        "default": true
+      },
+      "dm_memory_on": {
+        "description": "接长期记忆",
+        "hint": "装了 livingmemory 时主动消息自动带最相关的几条长期记忆",
+        "type": "bool",
+        "default": true
+      },
+      "dm_seg_enabled": {
+        "description": "分段发送",
+        "hint": "长的回复拆成多条、条间随机间隔，像真人打字",
+        "type": "bool",
+        "default": true
+      },
+      "dm_respect_sleep": {
+        "description": "跟作息联动",
+        "hint": "装了随机睡觉插件时，她睡着就不发消息",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "basic": {
+    "type": "object",
+    "title": "基础",
+    "description": "主动私聊：性格挡位 + 三类触发（各自带开关）",
+    "hint": "懒人第一步：选一个性格挡位，概率/频率数值全自动；往下晨起问候/睡前晚安/静默想你各自带开关，收信对象、称呼、作息联动在这里配",
+    "items": {
       "dm_miss_stance_gen": {
         "description": "按人设生成判断心态（一次性）",
         "hint": "打开并保存→插件自动按你当前的人设生成一段「主动发消息前的判断心态」（花一次生成 token）→自动填进下面的文本框并自动关回。想换人设后同步就再打开一次。生成失败开关会保持开，下次重载重试。不想要生成版：直接手填下面的框，别碰这个开关",
@@ -84,18 +158,6 @@
         "type": "list",
         "default": []
       },
-      "dm_with_context": {
-        "description": "附带聊天上下文",
-        "hint": "开=生成主动消息时附带该会话最近几条聊天记录（能接话茬，如\"刚说到那个\"）；关=只有人设盲发",
-        "type": "bool",
-        "default": true
-      },
-      "dm_memory_on": {
-        "description": "预取长期记忆",
-        "hint": "开=生成主动消息前先按目标会话隔离检索长期记忆（需安装 livingmemory，没装则无效果），把最相关的几条拼进上下文——她主动开口也带着记性；关=不取",
-        "type": "bool",
-        "default": true
-      },
       "dm_memory_k": {
         "description": "记忆条数",
         "hint": "预取的相关记忆条数（1~8）",
@@ -117,18 +179,6 @@
           "max": 40,
           "step": 1
         }
-      },
-      "dm_respect_sleep": {
-        "description": "作息联动（睡觉插件）",
-        "hint": "开=读 astrbot_plugin_dafeiyu_sleep 的状态：她睡着绝不主动发消息，晨起/睡前/静默想你全部按作息走，免打扰时段也自动跟作息浮动。没装睡觉插件自动当白天跑",
-        "type": "bool",
-        "default": true
-      },
-      "dm_seg_enabled": {
-        "description": "拟人分段发送",
-        "hint": "主动消息按句末标点/换行切分逐条发；下一条的间隔按其长度算的打字时间（每字0.10~0.18秒，0.8~8秒夹取）——像真人输入，防风控。关=整条一条发",
-        "type": "bool",
-        "default": true
       }
     }
   },
@@ -138,29 +188,6 @@
     "description": "触发：早晚安 + 想你驱动方式",
     "hint": "静默想你（推荐）按\"多久没聊\"触发；旧定时器=每天固定抽签时刻；off=关随机想念只留早晚安。带\"仅旧定时器模式\"标注的字段在新模式下无效。两次最短间隔/每日总量/随机次数受性格挡位接管（单项只在自定义挡生效）",
     "items": {
-      "dm_miss_mode": {
-        "description": "随机想念·驱动方式",
-        "hint": "silence=静默想你（v1.5 推荐：你多久没回话决定她想不想你，按概率掷骰）；timer=旧版定时抽签（每天在时间窗内随机抽时刻）；off=关闭随机想念",
-        "type": "string",
-        "default": "silence",
-        "options": [
-          "silence",
-          "timer",
-          "off"
-        ]
-      },
-      "dm_morning_on": {
-        "description": "晨起问候",
-        "hint": "醒来后5~30分钟来一句，带刚醒劲儿。昨夜你睡眠期发过言（存稿在）则自动让位给睡觉插件的晨间冲刷，不重复报到",
-        "type": "bool",
-        "default": true
-      },
-      "dm_night_on": {
-        "description": "睡前晚安",
-        "hint": "今晚入睡点前来说句晚安。睡前2小时聊过=必来收尾；你先道过晚安（20点后命中词表）也必来——她睡得再晚不漏你的道别；没聊没道别=按概率；已道过晚安不重复",
-        "type": "bool",
-        "default": true
-      },
       "miss_night_words": {
         "description": "道别词表",
         "hint": "你的消息含任一词=今晚你先道了别，她躺下时必来收尾（不受她入睡早晚影响）。子串匹配，留空=此规则关",
@@ -498,27 +525,33 @@
         "hint": "学习钳位：回应再热情，折扣深度不低于此（防学到\"毫不矜持\"）",
         "type": "float",
         "default": 0.45,
-        "slider": { "min": 0, "max": 0.95, "step": 0.05 }
+        "slider": {
+          "min": 0,
+          "max": 0.95,
+          "step": 0.05
+        }
       },
       "miss_cd_a_hi": {
         "description": "冷却·深度上限",
         "hint": "学习钳位：被晾再多，折扣深度不超过此（防学到\"再也不主动\"）",
         "type": "float",
         "default": 0.8,
-        "slider": { "min": 0, "max": 0.95, "step": 0.05 }
+        "slider": {
+          "min": 0,
+          "max": 0.95,
+          "step": 0.05
+        }
       },
       "miss_cd_a_slope": {
         "description": "冷却·学习斜率",
         "hint": "V 每偏离中性 0.1，深度 a 移动 base×slope×0.1（默认 1.0=温和）",
         "type": "float",
         "default": 1.0,
-        "slider": { "min": 0, "max": 3, "step": 0.1 }
-      },
-      "miss_afk_check_on": {
-        "description": "回归问候",
-        "hint": "TA说\"上班/吃饭\"离开，到该回来的点还没冒头→她主动问一句\"下班了吗\"。触发时刻=对数正态曲线（该回来的点后约20分钟劲儿最大，之后渐凉）；概率按TA离开时的语义分层：明确拒绝（别找我）=不问，有约定（晚点找你）=大概率，说了拜拜=低些，普通离开=随关系温度。每个离席只问一次，计入当日配额",
-        "type": "bool",
-        "default": false
+        "slider": {
+          "min": 0,
+          "max": 3,
+          "step": 0.1
+        }
       },
       "miss_afk_dur_map": {
         "description": "离席词·预期时长覆盖",
@@ -530,31 +563,29 @@
         "description": "回归问候·拒绝词",
         "hint": "离席消息里含这些词=本窗不问（TA明说了别联系）。只影响当次，不长期静音",
         "type": "list",
-        "default": ["别找我", "让我静静", "不想聊", "别烦我", "想静静"]
+        "default": [
+          "别找我",
+          "让我静静",
+          "不想聊",
+          "别烦我",
+          "想静静"
+        ]
       },
       "miss_afk_bye_words": {
         "description": "回归问候·告别词",
         "hint": "与离席词同现（如\"上班去了拜拜\"）=本轮聊天正式落幕，追问概率降档；\"拜拜，晚点找你\"同现时约定优先（说好了要回来）",
         "type": "list",
-        "default": ["拜拜", "再见", "回见"]
+        "default": [
+          "拜拜",
+          "再见",
+          "回见"
+        ]
       },
       "dm_afk_check_template": {
         "description": "回归问候·生成模板",
         "hint": "{afk_word}=TA说的离席词。生成走人设，不写死台词",
         "type": "text",
         "default": "他之前说{afk_word}离开，按你们的相处这个点该回来了，人却没冒头。你想主动问一句——「下班了吗」「该理我了吧」的意思，用你自己的说法。就一两句，别提系统。"
-      },
-      "dm_reunion_on": {
-        "description": "重逢委屈",
-        "hint": "TA特别久没来突然回来：那条回复注入重逢事实（隔了多久/期间TA找过几次没回/离开前的关系温度），哼一句还是闹一场由人设演。\"特别久\"是人类时间常数（轻哼2~3天/明显4~5天/大委屈7~10天封顶），冷热只影响强度不影响时机；关系本淡（离开前温度<0.35）则不委屈只疏离",
-        "type": "bool",
-        "default": true
-      },
-      "dm_sulk_on": {
-        "description": "被晾小委屈",
-        "hint": "她主动找TA后超过阈值没回（阈值随热度1~3小时，夜里发的不算晾到早上），TA再开口时那条回复带点被晾的小情绪；她发消息时TA若许过\"晚点找你\"，语气更冲（\"你明明说找我的\"）。只影响TA回来那一条的语气，不多发消息",
-        "type": "bool",
-        "default": true
       },
       "miss_cd_tau": {
         "description": "冷却·恢复常数（天）",
