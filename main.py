@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.5.10"
+PLUGIN_VERSION = "2.5.11"
 DM_PERSONA_SLICE = 2600  # v2.2.0：人设切片上限（旧1500装不下"唯一的"的说话规则段；主动消息日均≤7条，token 代价可忽略）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -1527,6 +1527,12 @@ class DafeiyuDmPlugin(Star):
                 lo, hi = 0.1, 0.4
             else:
                 lo, hi = 0.4, 0.7
+            # v2.5.11 有约在身=吃饭也惦记（用户拍板"可以抬"）：6小时内活的约定
+            # → 池子下限+0.2（平常0.4~0.7→0.6~0.9）。约了来找的人，等待时的念想
+            # 比平常离席浓——与回归问候的约定加成档同源
+            pl = s.get("promise") or {}
+            if pl.get("word") and 0 < time.time() - float(pl.get("event") or 0) <= 6 * 3600:
+                lo, hi = lo + 0.2, min(1.0, hi + 0.2)
             f_afk = round(random.uniform(lo, hi), 3)
         p = base * f_date * f_reply * f_heat * f_afk
         p = max(P.floor, p)
