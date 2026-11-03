@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.4.1"
+PLUGIN_VERSION = "2.5.0"
 DM_PERSONA_SLICE = 2600  # v2.2.0：人设切片上限（旧1500装不下"唯一的"的说话规则段；主动消息日均≤7条，token 代价可忽略）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -41,6 +41,11 @@ SLEEP_STATE_CANDIDATES = [
 TICK_SECONDS = 30
 NIGHT_WINDOW_MIN = 10  # 入睡点前多少分钟内发睡前消息
 ABS_TOTAL_CAP = 7     # 跨类型每日总量绝对上限（安全件，不可配）
+# v2.5.0 D7 发送熔断：连续失败 N 次 → 停发该会话，指数退避 30min 起翻倍至 12h 封顶
+SEND_FAIL_N = 3
+SEND_BREAK_BASE_MIN = 30
+SEND_BREAK_CAP_MIN = 12 * 60
+SEEN_WHISPER_WIN = 600  # B5：掷中前 10 分钟内他在群里说过话 → 悄悄话口吻
 QUIET_HARD_LO = 8 * 60    # 评估时段硬边界 08:00
 QUIET_HARD_HI = 23 * 60 + 30  # …~23:30（风控：深夜不评估不发送）
 AFK_GRACE_MIN = 5.0  # 离席/约定词宽限：词说出后对话在5分钟内结束→仍按该档（"吃饭啦""拜拜"分开发不丢档）
@@ -120,6 +125,12 @@ DEFAULTS = {
         "你刚躺下准备睡了，临睡前才想起来还没跟{who}道晚安，现在补上。"
         "就一句——说法按你们的相处氛围来，带着点迷糊。"
         "别提任何系统或作息数字。"
+    ),
+    "dm_morning_reply_template": (
+        "你刚睡醒没多久，翻手机才发现{who}在你睡着的时候给你发了留言。"
+        "你主动回TA一条——\"刚醒，看到你发的消息了\"的意思，自然地回应留言里的内容"
+        "（TA说了什么就接什么，该答的答、该撒娇的撒娇，按你们的相处来）。"
+        "一两句，刚醒的状态自然带出来。别提任何系统或作息数字。"
     ),
     "dm_night2_template": (
         "你们刚才已经道过晚安（或道别）了。你现在真的躺下要睡了——"
@@ -448,6 +459,7 @@ class DafeiyuDmPlugin(Star):
         self.c_gap = max(0.0, float(g("dm_min_gap_hours") or 0))
         self.c_cap = min(ABS_TOTAL_CAP, max(1, int(g("dm_daily_cap") or 1)))  # 硬顶7，面板填大也没用
         self.tpl_morning = str(g("dm_morning_template"))
+        self.tpl_morning_reply = str(g("dm_morning_reply_template") or DEFAULTS["dm_morning_reply_template"])
         self.tpl_night = str(g("dm_night_template"))
         self.tpl_random = str(g("dm_random_template"))
         self.tpl_makeup_night = str(
@@ -946,7 +958,37 @@ class DafeiyuDmPlugin(Star):
             )
         except Exception:
             self._st = {}
+        self._migrate_state()
         self._rollover_day()
+
+    def _migrate_state(self):
+        """v2.5.0 多目标化迁移：晨起/晚安计划、连跳计数、感情温度从单记录改 per-umo/per-qq。
+        旧单条归给原第一目标（无目标解析得到就弃，重算/重建无损失）"""
+        try:
+            tmap = self._target_map() or {}
+            flat = [f"{pid}:FriendMessage:{qq}" for pid, qs in tmap.items() for qq in qs]
+            first_umo = flat[0] if flat else ""
+            first_qq = first_umo.split(":")[-1] if first_umo else ""
+            m = self._st.get("morning")
+            if isinstance(m, dict) and "key" in m:  # 旧单条 {key,at,sent}
+                self._st["morning"] = {first_umo: m} if first_umo else {}
+            elif m is None:
+                self._st["morning"] = self._st.get("morning") or {}
+            n = self._st.get("night")
+            if isinstance(n, dict) and "key" in n:
+                self._st["night"] = {first_umo: n} if first_umo else {}
+            elif n is None:
+                self._st["night"] = self._st.get("night") or {}
+            for k in ("morning_skip", "evening_skip"):
+                v = self._st.get(k)
+                if isinstance(v, int) and not isinstance(v, bool):
+                    self._st[k] = {first_qq: v} if first_qq else {}
+                elif not isinstance(v, dict):
+                    self._st[k] = {}
+            # t_warm：旧全局 {rounds,...,t,ts}（判据=有 "t" 键）→ 首次 _warm_t 写入时整体换新，
+            # 读侧由 _t_warm_get 兼容兜底，这里不抢跑（目标解析时机不定）
+        except Exception:
+            logger.warning("[主动私聊] 旧状态迁移失败（按空状态处理）", exc_info=True)
 
     def _save_state(self):
         try:
@@ -974,14 +1016,32 @@ class DafeiyuDmPlugin(Star):
                     self._st["drift"] = None
             self._st.setdefault("mood", 1.0)  # 中途升级没有昨天的游走值，从1.0起步
             self._st.setdefault("ledger", {"inner": 0, "gen": 0, "tools": 0, "vetoed": 0, "void_gen": 0})
-            self._st.setdefault("morning_skip", 0)
-            self._st.setdefault("evening_skip", 0)
+            self._st.setdefault("morning_skip", {})
+            self._st.setdefault("evening_skip", {})
             self._st.setdefault("night_chat", {})
+            self._st.setdefault("seen", {})
             return
-        yesterday_greeted_m = bool((self._st.get("morning") or {}).get("sent"))
-        yesterday_greeted_n = bool((self._st.get("night") or {}).get("sent"))
-        self._st["morning_skip"] = 0 if yesterday_greeted_m else int(self._st.get("morning_skip", 0)) + 1
-        self._st["evening_skip"] = 0 if yesterday_greeted_n else int(self._st.get("evening_skip", 0)) + 1
+        # v2.5.0 连跳计数 per-qq：昨天该号计划已发→清零，没发→+1（无计划的号不动）
+        ms = self._st.get("morning_skip") or {}
+        ns = self._st.get("evening_skip") or {}
+        if not isinstance(ms, dict):
+            ms = {}
+        if not isinstance(ns, dict):
+            ns = {}
+        for umo, plan in (self._st.get("morning") or {}).items():
+            if isinstance(plan, dict) and plan.get("key"):
+                qq = str(umo.split(":")[-1])
+                ms[qq] = 0 if plan.get("sent") else int(ms.get(qq, 0)) + 1
+        for umo, plan in (self._st.get("night") or {}).items():
+            if isinstance(plan, dict) and plan.get("key"):
+                qq = str(umo.split(":")[-1])
+                ns[qq] = 0 if plan.get("sent") else int(ns.get(qq, 0)) + 1
+        self._st["morning_skip"] = ms
+        self._st["evening_skip"] = ns
+        # 群在场记录滚动：只留 7 天内有活动的目标
+        seen = self._st.get("seen") or {}
+        cut7 = time.time() - 7 * 86400
+        self._st["seen"] = {q: t for q, t in seen.items() if float(t) >= cut7}
         # 每日微扰（±20%，当日固定）：阈值三档 + base_p
         if self.c_drift:
             def _dr(x, lo, hi):
@@ -1022,8 +1082,8 @@ class DafeiyuDmPlugin(Star):
                     plans.append(ts)
         self._st.update({
             "date": today,
-            "morning": None,   # {"key","at","sent"} 晨起计划
-            "night": None,     # {"key","sent"} 睡前（按夜锚日去重）
+            "morning": {},   # v2.5.0 per-umo：{umo: {"key","at","sent"}} 晨起计划
+            "night": {},     # v2.5.0 per-umo：{umo: {"key","sent"}} 睡前（按夜锚日去重）
             "random_plan": sorted(plans),
             "random_sent": 0,
             "sent_total": 0,
@@ -1044,7 +1104,6 @@ class DafeiyuDmPlugin(Star):
         if s is None:
             s = sess[umo] = {
                 "act_ts": 0.0, "act_from": "", "msg_times": [],
-                "night_in": {},        # date -> True（睡眠期来言=存稿）
                 "reply_factor": 1.0, "pending_reply": None,
                 "fires": [],           # 想你触发日期（日期档用，最近30天）
                 "unans": 0,            # 未回主动消息计数（熔断）
@@ -1108,9 +1167,15 @@ class DafeiyuDmPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_any_message(self, event: AstrMessageEvent):
-        """只记账不动消息（任何异常静默放行）。群消息 v1.5 忽略（群信号是 v1.5.1）。"""
+        """只记账不动消息（任何异常静默放行）。群消息只记目标在场（v2.5.0）。"""
         try:
             umo = str(getattr(event, "unified_msg_origin", "") or "")
+            if ":GroupMessage:" in umo:
+                # v2.5.0 群在场信号：目标在任意群冒头 → seen_ts（想念钟软重置/悄悄话口吻用）
+                sender = str(event.get_sender_id() or "")
+                if sender and sender in self._target_qqs():
+                    self._st.setdefault("seen", {})[sender] = time.time()
+                return
             if ":FriendMessage:" not in umo:
                 return
             sender = str(event.get_sender_id() or "")
@@ -1138,7 +1203,7 @@ class DafeiyuDmPlugin(Star):
             prev_msgs = s.get("msg_times") or []
             # v2.3.0 重逢检测：隔很久再开口 → 置一次性标志，回复时注入委屈事实
             if self.c_reunion_on and prev_msgs and (now - float(prev_msgs[-1])) > 48 * 3600:
-                tw = self._st.get("t_warm") or {}
+                tw = self._t_warm_get(umo)
                 if tw.get("t") is not None:
                     s["t_warm_before"] = tw
                 s["_reunion_due"] = True
@@ -1212,9 +1277,6 @@ class DafeiyuDmPlugin(Star):
                 if hit:
                     s["together_ts"] = now
                     s["together_word"] = hit
-            # 存稿：睡眠期来言（自己的记录，不依赖 sleep 缓冲内部结构）
-            if self._sleep_phase() == "sleeping":
-                s["night_in"][datetime.now().date().isoformat()] = True
             # 夜聊频率：22 点后来的言
             if datetime.now().hour >= 22:
                 nc = self._st.setdefault("night_chat", {})
@@ -1336,7 +1398,7 @@ class DafeiyuDmPlugin(Star):
         a = P.cd_a
         if self.c_cd_a_learn:
             v = float(s.get("exp_v", 0.6))
-            tw = self._st.get("t_warm") or {}
+            tw = self._t_warm_get(umo)
             t_rel = float(tw.get("t") or 0.5) if float(tw.get("ts") or 0) > time.time() - 6 * 3600 else 0.5
             a = min(self.c_cd_a_hi, max(self.c_cd_a_lo,
                    a * (1.0 + self.c_cd_a_slope * (0.6 - v)) * (1.0 + 0.15 * (0.5 - t_rel))))
@@ -1570,6 +1632,39 @@ class DafeiyuDmPlugin(Star):
                     continue
         return result
 
+    def _target_qqs(self) -> set:
+        """全部目标 QQ（缓存 60s——群消息高频进来，_target_map 每条跑一遍太重）"""
+        now = time.time()
+        if not getattr(self, "_tq_cache", None) or now - self._tq_cache[0] > 60:
+            try:
+                self._tq_cache = (now, {str(q) for qs in (self._target_map() or {}).values() for q in qs})
+            except Exception:
+                self._tq_cache = (now, set())
+        return self._tq_cache[1]
+
+    def _t_warm_get(self, umo: str) -> dict:
+        """v2.5.0 per-umo 读感情温度：新结构 {umo: {...}}；旧全局单记录（有 "t" 键）
+        兼容归给第一目标，其余目标拿到空 dict（消费侧按缺省 0.5 处理）"""
+        tw = self._st.get("t_warm") or {}
+        ent = tw.get(umo)
+        if isinstance(ent, dict) and "t" in ent:
+            return ent
+        if "t" in tw:  # 旧全局单条
+            try:
+                flat = [str(q) for qs in (self._target_map() or {}).values() for q in qs]
+                if flat and str(umo.split(":")[-1]) == flat[0]:
+                    return tw
+            except Exception:
+                pass
+        return {}
+
+    def _target_umos(self) -> list:
+        """全部目标的 umo 平铺（晨起/晚安 per-umo 计划用）"""
+        try:
+            return [f"{pid}:FriendMessage:{qq}" for pid, qs in (self._target_map() or {}).items() for qq in qs]
+        except Exception:
+            return []
+
     def _targets(self):
         flat = []
         for qs in self._target_map().values():
@@ -1593,54 +1688,68 @@ class DafeiyuDmPlugin(Star):
     async def _on_tick(self):
         if not self.enabled:
             return
-        # 补发通道：管理员显式意志，跳过活跃终检强制发（仍计总量）
+        # 补发通道：管理员显式意志，跳过活跃终检强制发（仍计总量）。
+        # v2.5.0 A4：可选 "qq" 字段定向补发（不填=全员广播，兼容旧文件）
         mk = self._consume_makeup()
         if mk:
             tpl = {
                 "night": self.tpl_makeup_night,
                 "morning": self.tpl_morning,
                 "random": self.tpl_random,
-            }.get(mk, self.tpl_random)
-            await self._fire("makeup", tpl)
+            }.get(mk.get("kind"), self.tpl_random)
+            await self._fire("makeup", tpl, only_qq=mk.get("qq") or None)
         self._rollover_day()
         now = time.time()
         phase = self._sleep_phase()
         sl = self._sleep_state() or {}
 
-        # ---------- 晨起 ----------
+        # ---------- 晨起（v2.5.0 per-umo：每个目标自己的计划/掷骰/发送；留言回应线） ----------
         if self.c_morning:
             wake_ts = float(sl.get("wake_at") or 0)
-            m = self._st.get("morning")
+            plans = self._st.get("morning") or {}
             if wake_ts and now - wake_ts < 6 * 3600:
                 key = datetime.fromtimestamp(wake_ts).date().isoformat()
-                if not m or m.get("key") != key:
-                    shift = random.uniform(30, 60) * 60 if self._night_owl_level() == "owl" else 0
-                    m = {"key": key, "at": wake_ts + random.uniform(5, 30) * 60 + shift, "sent": False}
-                    self._st["morning"] = m
+                new_plan = False
+                for umo in self._target_umos():
+                    m = plans.get(umo)
+                    if not m or m.get("key") != key:
+                        shift = random.uniform(30, 60) * 60 if self._night_owl_level() == "owl" else 0
+                        plans[umo] = {"key": key, "at": wake_ts + random.uniform(5, 30) * 60 + shift,
+                                      "sent": False}
+                        new_plan = True
+                if new_plan:
+                    self._st["morning"] = plans
                     self._save_state()
-            if m and not m.get("sent") and now >= m.get("at", 0):
-                if phase == "temp_wake":
-                    m["at"] = now + 10 * 60
-                    self._save_state()
-                elif phase == "awake":
-                    m["tries"] = int(m.get("tries", 0)) + 1
-                    await self._morning_decide(m, wake_ts, now)
-                    self._save_state()
+            for umo, m in list(plans.items()):
+                if not m.get("sent") and now >= m.get("at", 0):
+                    if phase == "temp_wake":
+                        m["at"] = now + 10 * 60
+                        self._save_state()
+                    elif phase == "awake":
+                        m["tries"] = int(m.get("tries", 0)) + 1
+                        await self._morning_decide(umo, m, wake_ts, now)
+                        self._save_state()
 
-        # ---------- 睡前 ----------
+        # ---------- 睡前（v2.5.0 per-umo：今晚聊过必收尾/已道晚安换 night2 各自独立判） ----------
         if self.c_night:
             bed_ts = self._tonight_bed_ts(sl, now)
             if bed_ts:
                 key = datetime.fromtimestamp(bed_ts).date().isoformat()
-                n = self._st.get("night")
-                if not n or n.get("key") != key:
-                    n = {"key": key, "sent": False}
-                    self._st["night"] = n
+                nplans = self._st.get("night") or {}
+                new_plan = False
+                for umo in self._target_umos():
+                    n = nplans.get(umo)
+                    if not n or n.get("key") != key:
+                        nplans[umo] = {"key": key, "sent": False}
+                        new_plan = True
+                if new_plan:
+                    self._st["night"] = nplans
                     self._save_state()
-                if not n.get("sent") and phase == "awake" and 0 < bed_ts - now <= NIGHT_WINDOW_MIN * 60 + 60:
-                    n["tries"] = int(n.get("tries", 0)) + 1
-                    await self._night_decide(n, bed_ts, now)
-                    self._save_state()
+                for umo, n in list(nplans.items()):
+                    if not n.get("sent") and phase == "awake" and 0 < bed_ts - now <= NIGHT_WINDOW_MIN * 60 + 60:
+                        n["tries"] = int(n.get("tries", 0)) + 1
+                        await self._night_decide(umo, n, bed_ts, now)
+                        self._save_state()
 
         # ---------- 随机想念：timer 模式沿用 v1.4（到点即发+按住队列） ----------
         if self.c_miss_mode == "timer":
@@ -1735,33 +1844,114 @@ class DafeiyuDmPlugin(Star):
         """今晚入睡点（判定见 _night_bed_from_state）"""
         return self._night_bed_from_state(sl, now)
 
-    async def _morning_decide(self, m: dict, wake_ts: float, now: float):
-        """晨起决策：存稿→让位冲刷；用户先开口→跳过；锚点必发；概率分支掷骰"""
-        tmap = self._target_map()
-        if not tmap:
-            return
-        pid, qq = next(iter(tmap.items()))[0], next(iter(tmap.items()))[1][0]
-        umo = f"{pid}:FriendMessage:{qq}"
+    def _sleep_pending_of(self, umo: str, sl: dict) -> list:
+        """v2.5.0 E：读睡觉插件的夜间缓冲（该目标睡着期间发来的留言）。只读零污染；
+        sleep 未装/无状态/没缓冲 → 空表。buffers 条目 {ts,name,text}"""
+        try:
+            buf = (sl or {}).get("buffers") or {}
+            ent = buf.get(umo)
+            return [e for e in (ent or []) if isinstance(e, dict) and str(e.get("text") or "").strip()]
+        except Exception:
+            return []
+
+    def _mark_replied(self, umo: str):
+        """v2.5.0 E：留言回应线发送后写标记文件到睡觉插件数据目录（makeup.json 同款
+        文件通信）——sleep 冲刷前见标记跳过注入，防"她回完留言、冲刷轮再演一遍翻未读" """
+        try:
+            p = self._data_dir.parent / "astrbot_plugin_dafeiyu_sleep" / "dm_morning_reply.json"
+            data = {}
+            try:
+                if p.exists():
+                    data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+            today = datetime.now().date().isoformat()
+            if data.get("date") != today:
+                data = {"date": today, "umos": []}
+            if umo not in data["umos"]:
+                data["umos"].append(umo)
+            p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            logger.info("[主动私聊] 留言回应标记文件写入失败（sleep 侧会重复冲刷，无功能损害）")
+
+    def _flushed_today(self, umo: str, sl: dict) -> bool:
+        """该目标今天的晨间冲刷是否已发生（sleep 的 morning_flushed 标记）"""
+        mf = (sl or {}).get("morning_flushed") or {}
+        return mf.get("date") == datetime.now().date().isoformat() and umo in (mf.get("umos") or [])
+
+    async def _morning_reply_send(self, umo: str, msgs: list, now: float) -> bool:
+        """v2.5.0 E 留言回应线：醒后必发（p=1.0）一条"刚醒看到留言"。必发=不走 AI 否决；
+        发送前再查一次冲刷标记（他先开口=冲刷已带出内容，互斥作废）"""
+        sl = self._sleep_state() or {}
+        if self._flushed_today(umo, sl):
+            self._dlog({"t": "morning_reply_void", "why": "他已先开口,冲刷已带出"})
+            return True  # 销账：让位给冲刷
+        if not self._send_open(umo, now):
+            return False  # D7 发送熔断中：退避后窗口再看
+        lines = [f"[{_fmt := datetime.fromtimestamp(float(m.get('ts') or now)).strftime('%H:%M')}] {str(m.get('text') or '')[:60]}"
+                 for m in msgs[:5]]
+        ctx = self._status_ctx(umo) + (
+            f"[TA在你睡着时给你发了 {len(msgs)} 条留言（刚醒来才看到）：\n" + "\n".join(lines) + "]\n"
+        )
+        text = await self._gen(self.tpl_morning_reply, umo=umo, kind="morning_reply",
+                               veto_ok=False, veto_ctx=ctx)
+        if text is None:
+            text = random.choice(self.c_pool)  # 必发：生成失败回落语料池也不许哑
+        try:
+            await self._send_human(umo, text)
+        except Exception:
+            logger.warning(f"[主动私聊] 留言回应发送失败 {umo}", exc_info=True)
+            return False  # 不销账，下轮 tick 再试（at 顺延）
+        # 留言原文随她的回应一并归档（冲刷被跳过后，历史里也得有这笔账）
+        archive_text = text + (f"\n[本轮工具：{'；'.join(self._tool_trace[:3])}]" if self._tool_trace else "")
+        try:
+            cm = self.context.conversation_manager
+            cid = await cm.get_curr_conversation_id(umo)
+            if cid:
+                await cm.add_message_pair(
+                    cid=cid,
+                    user_message={"role": "user", "content": "[系统标记：TA睡着时发来上述留言，你刚醒主动回应了]" + "\n" + "\n".join(lines)},
+                    assistant_message={"role": "assistant", "content": archive_text},
+                )
+        except Exception:
+            logger.warning("[主动私聊] 留言回应归档失败（不影响发送）", exc_info=True)
+        self._mark_replied(umo)
+        # 配额照计（正经主动消息）：总量/间隔/每人计数；不计 unans（这是回应他，不是主动搭话）
+        self._st["sent_total"] = int(self._st.get("sent_total", 0)) + 1
+        self._st["last_dm_ts"] = now
+        qq = str(umo.split(":")[-1])
+        if self.c_tier_per_conf:
+            d = self._st.setdefault("per", {}).setdefault(qq, {})
+            d["sent"] = int(d.get("sent", 0)) + 1
+        self._dlog({"t": "morning_reply", "gap_min": round((now - float(self._sleep_state().get("wake_at") or now)) / 60, 1),
+                    "n_msgs": len(msgs), "text": text[:30]})
+        return True
+
+    async def _morning_decide(self, umo: str, m: dict, wake_ts: float, now: float):
+        """晨起决策（v2.5.0 per-umo）：睡时留言→必发回应线（替代掷骰）；他先开口→让位；
+        锚点必发；概率分支掷骰。原"存稿让位冲刷"分支已删（被回应线替代）"""
         s = self._sess(umo)
-        # 存稿/冲刷让位：睡眠期来言被睡觉插件守门截停，dm 自己看不见（v1.5.7 修复）——
-        # 直接读睡觉插件的"晨间冲刷已发生"标记；夜间来言本会触发冲刷，晨间内容已带出，不重复报到
-        night_in = s.get("night_in") or {}
-        mf = (self._sleep_state() or {}).get("morning_flushed") or {}
-        flushed = mf.get("date") == datetime.now().date().isoformat() and umo in (mf.get("umos") or [])
-        if night_in or flushed:
-            m["sent"] = True
-            if night_in:
-                s["night_in"] = {}
-            self._dlog({"t": "morning_skip", "why": "存稿在,让位晨间冲刷" if night_in else "晨间冲刷已发生,让位"})
-            return
-        # 用户醒后已先开口 → 冲刷已带出晨间内容
+        sl = self._sleep_state() or {}
+        # 他醒后已先开口 → 冲刷已带出晨间内容，不重复报到
         if wake_ts and await self._user_spoke_after(umo, wake_ts):
             m["sent"] = True
-            self._dlog({"t": "morning_skip", "why": "用户已先开口"})
+            self._dlog({"t": "morning_skip", "why": "用户已先开口", "umo": umo.split(":")[-1]})
             return
-        anchor = int(self._st.get("morning_skip", 0)) >= 2  # 连跳2天→今日必发
+        # v2.5.0 E：睡着时有他的留言 → 不掷骰，醒后必发回应（回应即报到）
+        pend = self._sleep_pending_of(umo, sl)
+        if pend:
+            ok = await self._morning_reply_send(umo, pend, now)
+            if ok:
+                m["sent"] = True
+                self._st.setdefault("morning_skip", {})[str(umo.split(":")[-1])] = 0
+            elif int(m.get("tries", 0)) >= 8:
+                m["sent"] = True  # 重试上限：放弃（防发送持续失败时空转生成）
+            else:
+                m["at"] = now + 5 * 60  # 发送失败（终检/网络）：5分钟后再看
+            return
+        qq = str(umo.split(":")[-1])
+        anchor = int((self._st.get("morning_skip") or {}).get(qq, 0)) >= 2  # 连跳2天→今日必发
         if not m.get("rolled"):
-            sl = self._sleep_state() or {}
             ln = sl.get("last_night") or sl.get("night") or {}
             bed_ts = float(ln.get("bed_ts") or 0)
             presleep = 0
@@ -1785,20 +1975,17 @@ class DafeiyuDmPlugin(Star):
             if sent or m["tries"] >= 6:
                 m["sent"] = True
                 if sent:
-                    self._st["morning_skip"] = 0
+                    self._st.setdefault("morning_skip", {})[qq] = 0
             else:
                 m["at"] = now + 5 * 60  # 终检/近距查重顺延，5分钟后再看
         else:
             m["sent"] = True  # 没中：今日作废（锚点已强制 win=True）
 
-    async def _night_decide(self, n: dict, bed_ts: float, now: float):
-        """睡前决策：今晚聊过→必收尾；没聊→概率×夜聊档；锚点必发；已道晚安→换收尾模板"""
-        tmap = self._target_map()
-        if not tmap:
-            return
-        pid, qq = next(iter(tmap.items()))[0], next(iter(tmap.items()))[1][0]
-        umo = f"{pid}:FriendMessage:{qq}"
+    async def _night_decide(self, umo: str, n: dict, bed_ts: float, now: float):
+        """睡前决策（v2.5.0 per-umo）：今晚聊过→必收尾；没聊→概率×夜聊档；锚点必发；
+        已道晚安→换收尾模板——各目标会话独立判"""
         s = self._sess(umo)
+        qq = str(umo.split(":")[-1])
         chatted = len([t for t in (s.get("msg_times") or []) if bed_ts - 2 * 3600 <= t <= now]) > 0
         # 你先道过别（同晚8小时内）→ 即使在她睡前2小时窗口外，躺下也必收尾：
         # 道别是对等的，不该因为她自己睡晚了就漏掉你说的晚安
@@ -1807,7 +1994,7 @@ class DafeiyuDmPlugin(Star):
         if said_bye:
             chatted = True
         already = await self._already_said_goodnight(umo)
-        anchor = int(self._st.get("evening_skip", 0)) >= 2
+        anchor = int((self._st.get("evening_skip") or {}).get(qq, 0)) >= 2
         if not n.get("rolled"):
             owl_f = {"owl": 1.2, "mid": 1.0, "early": 0.7}[self._night_owl_level()]
             p = self._P(umo).evening_base * owl_f
@@ -1823,7 +2010,7 @@ class DafeiyuDmPlugin(Star):
             if sent or n["tries"] >= 6:
                 n["sent"] = True
                 if sent:
-                    self._st["evening_skip"] = 0
+                    self._st.setdefault("evening_skip", {})[qq] = 0
             else:
                 n["tries2"] = int(n.get("tries2") or 0) + 1
                 n["at_hint"] = now + 5 * 60  # 顺延5分钟；窗口逻辑下轮 tick 自然再看
@@ -1833,6 +2020,8 @@ class DafeiyuDmPlugin(Star):
     async def _send_greet(self, kind: str, umo: str, template: str, now: float, force: bool = False) -> bool:
         """早晚安发送：活跃终检（force=到睡觉线豁免）→ 近距查重 → 否决/生成 → 拟人发送+记账"""
         s = self._sess(umo)
+        if not self._send_open(umo, now):
+            return False  # D7 发送熔断中：本轮不发（不销账，退避结束后窗口再看）
         if not force:
             if self.c_active_check and now - float(s.get("act_ts") or 0) < self.c_active_check * 60:
                 return False  # 你正在聊：顺延
@@ -1909,12 +2098,18 @@ class DafeiyuDmPlugin(Star):
         v = float(s.get("exp_v", 0.6))
         parts.append(days_line + f"；TA近来的回应热情（期待值 {v:.2f}，乘子 {self._rw_factor(umo):.2f}）")
         # v2.3.0 生成端 T 事实：关系温度三档（措辞自然带温度；概率侧另有接入）
-        tw = self._st.get("t_warm") or {}
+        tw = self._t_warm_get(umo)
         tw_ts = float(tw.get("ts") or 0)
         if tw_ts and time.time() - tw_ts < 6 * 3600:
             tv = float(tw.get("t") or 0.5)
             mood_w = "热乎" if tv > 0.65 else ("有点淡" if tv < 0.35 else "平常")
             parts.append(f"最近你们聊得{mood_w}")
+        # v2.5.0 睡觉插件困倦感知（sleep v0.8 联动，软耦合：字段缺席=无行）
+        dl = int((self._sleep_state() or {}).get("drowsy_level") or 0)
+        if dl >= 2:
+            parts.append("你现在很困（话少、反应慢，困得有点撑不住）")
+        elif dl == 1:
+            parts.append("你现在有点困")
         parts.append(f"今日已主动 {int(self._st.get('sent_total', 0))} 条；现在 {datetime.now().strftime('%H:%M')}")
         return "[背景事实：" + "；".join(parts) + "]\n"
 
@@ -1983,8 +2178,11 @@ class DafeiyuDmPlugin(Star):
              + 0.3 * (0.5 if r_freq is None else r_freq)
              + 0.3 * (0.5 if keep is None else keep))
         t = round(min(1.0, max(0.0, t)), 3)
-        self._st["t_warm"] = {"rounds": r_rounds, "freq": r_freq, "keep": keep, "t": t,
-                              "ts": time.time(), "at": datetime.now().strftime("%m-%d %H:%M")}
+        tw = self._st.get("t_warm")
+        if not isinstance(tw, dict) or "t" in tw:  # 旧全局单条 → per-umo 换新
+            tw = self._st["t_warm"] = {}
+        tw[umo] = {"rounds": r_rounds, "freq": r_freq, "keep": keep, "t": t,
+                   "ts": time.time(), "at": datetime.now().strftime("%m-%d %H:%M")}
         return t
 
     # ---------- v2.3.0 回归问候 ----------
@@ -2048,7 +2246,7 @@ class DafeiyuDmPlugin(Star):
         promise = s.get("promise") or {}
         has_promise = bool(promise.get("word")) and 0 <= float(promise.get("event") or -1) <= float(a.get("win_at") or 0)
         bye = any(w in str(a.get("text") or "") for w in self.c_bye_words)
-        tw = self._st.get("t_warm") or {}
+        tw = self._t_warm_get(umo)
         T = float(tw.get("t") or 0.5) if float(tw.get("ts") or 0) > time.time() - 6 * 3600 else self._warm_t(umo)
         if has_promise:
             f = random.uniform(*INTENT_POOL_PROMISE)
@@ -2102,7 +2300,7 @@ class DafeiyuDmPlugin(Star):
                 a["intent"], a["f_intent"] = intent, f
                 self._save_state()
             intent, f = a.get("intent"), float(a.get("f_intent") or 0)
-            T = float((self._st.get("t_warm") or {}).get("t") or 0.5)
+            T = float(self._t_warm_get(umo).get("t") or 0.5)
             P = self._P(umo)
             drift = self._drift_vals(umo)
             base = float(drift.get("base", P.base_p))
@@ -2356,6 +2554,11 @@ class DafeiyuDmPlugin(Star):
             ev = float(s.get("act_ts") or 0)
             if not ev:
                 continue  # 从没说过话：无静默可言
+            # v2.5.0 B5 群在场软重置：他在群里冒过头=不算分别，静默钟从群活动重起
+            # （hazard 不照"消失N小时"累积；不并入活跃闸门——群聊中私聊戳一句是真人行为）
+            seen = float((self._st.get("seen") or {}).get(qq) or 0)
+            if seen > ev:
+                ev = seen
             # ① 中签 pending 的到点处理
             pend = s.get("pending")
             if pend and now >= float(pend.get("at") or 0):
@@ -2473,19 +2676,40 @@ class DafeiyuDmPlugin(Star):
     async def _fire_miss(self, umo: str, now: float):
         """中签发送：否决（可选）→ 情景门控工具生成 → 拟人发送 → 记账"""
         s = self._sess(umo)
+        if not self._send_open(umo, now):
+            return  # D7 发送熔断中：本轮不掷发（pending 保留，退避后再看）
         rounds = self._heat_rounds(umo, now)
         tier = (s.get("dice") or {}).get("tier") or "normal"
         tag = self._scenario_tag(umo, tier)
+        # v2.5.0 B6 迟到晨间口吻：晨起骰输且这是她今天对这个号的首条主动 → 开口带刚醒味
+        today = datetime.now().date().isoformat()
+        mplan = (self._st.get("morning") or {}).get(umo) or {}
+        first_today = self._per_cnt(umo, "sent") == 0
+        if mplan.get("key") == today and mplan.get("win") is False and first_today:
+            tag = "睡醒后还没说过话"
+        extra_ctx = ""
+        if tag == "睡醒后还没说过话":
+            extra_ctx = "（你睡醒到现在还没主动跟TA说过话，这条开口自然带点刚醒的感觉，不用硬找话题）\n"
+        # v2.5.0 B5 悄悄话口吻：掷中前他还在群里说话 → 私聊这条像凑过去悄悄说
+        qq = str(umo.split(":")[-1])
+        seen = float((self._st.get("seen") or {}).get(qq) or 0)
+        if seen and 0 < now - seen < SEEN_WHISPER_WIN:
+            extra_ctx += "（TA这会儿正在群里聊着天，你这条是私聊发的——像凑到耳边悄悄说，可以带点\"群里不方便说\"的意味）\n"
         if self.c_gen_mode.get("random") == "template":
             text = random.choice(self.c_pool)
             status = "ok"
         else:
+            tier_note = ("" if tag == "睡醒后还没说过话" else
+                         "去吃饭离席" if tier == "afk" else "约定未赴" if tier == "promise"
+                         else "聊嗨断线" if tier == "hot" else "普通冷场")
+            scen_line = f"[本次情景：{tag}{'（' + tier_note + '）' if tier_note else ''}]\n"
             text = await self._gen(
                 self.tpl_miss_random, umo=umo, kind="random",
                 veto_ok=self.c_ai_veto,
                 veto_ctx=self._status_ctx(umo) + self._together_ctx(umo, now)
                     + self._stance_line(umo)
-                    + f"[本次情景：{tag}（{'去吃饭离席' if tier=='afk' else '约定未赴' if tier=='promise' else '聊嗨断线' if tier=='hot' else '普通冷场'}）]\n",
+                    + scen_line
+                    + extra_ctx,
                 scenario=tag,
             )
             status = self._last_gen_status
@@ -2540,13 +2764,15 @@ class DafeiyuDmPlugin(Star):
             logger.warning("[主动私聊] 主动消息归档对话历史失败（不影响发送）", exc_info=True)
 
     def _consume_makeup(self):
-        """补发指令文件：外部/管理往 data/makeup.json 写 {"kind":"night"} 即触发，读后即删"""
+        """补发指令文件：外部/管理往 data/makeup.json 写 {"kind":"night"} 即触发，读后即删。
+        v2.5.0 A4：可加 "qq" 字段定向补发（不填=全员广播）"""
         try:
             p = self._data_dir / "makeup.json"
             if p.exists():
-                v = json.loads(p.read_text(encoding="utf-8")).get("kind")
+                v = json.loads(p.read_text(encoding="utf-8"))
                 p.unlink(missing_ok=True)
-                return str(v) if v else None
+                if isinstance(v, dict) and v.get("kind"):
+                    return {"kind": str(v["kind"]), "qq": str(v.get("qq") or "").strip() or None}
         except Exception:
             logger.warning("[主动私聊] 补发指令文件读取失败", exc_info=True)
         return None
@@ -2563,15 +2789,35 @@ class DafeiyuDmPlugin(Star):
         ]
         return segs or [text]
 
+    def _send_open(self, umo: str, now: float = None) -> bool:
+        """v2.5.0 D7 发送熔断闸门：该会话是否允许发送（连续失败指数退避中=关）"""
+        now = now or time.time()
+        return now >= float(self._sess(umo).get("send_break_until") or 0)
+
     async def _send_human(self, umo: str, text: str) -> None:
         """拟人发送：按句切分逐条发；下一条的间隔=按它的长度算的打字时间
-        （每字 0.10~0.18 秒随机，下限 0.8s、上限 8s）——长句等得久，像真人输入，也防风控"""
+        （每字 0.10~0.18 秒随机，下限 0.8s、上限 8s）——长句等得久，像真人输入，也防风控。
+        v2.5.0 D7：失败记连败（≥3 指数退避），成功清零"""
         segs = self._split_text(text) if self.c_seg_on else [text]
-        for i, seg in enumerate(segs):
-            if i:
-                typing = min(8.0, max(0.8, len(segs[i]) * random.uniform(0.10, 0.18)))
-                await asyncio.sleep(typing)
-            await self.context.send_message(umo, MessageChain().message(seg))
+        try:
+            for i, seg in enumerate(segs):
+                if i:
+                    typing = min(8.0, max(0.8, len(segs[i]) * random.uniform(0.10, 0.18)))
+                    await asyncio.sleep(typing)
+                await self.context.send_message(umo, MessageChain().message(seg))
+        except Exception:
+            s = self._sess(umo)
+            fail = int(s.get("send_fail") or 0) + 1
+            s["send_fail"] = fail
+            if fail >= SEND_FAIL_N:
+                break_min = min(SEND_BREAK_CAP_MIN, SEND_BREAK_BASE_MIN * (2 ** (fail - SEND_FAIL_N)))
+                s["send_break_until"] = time.time() + break_min * 60
+                self._dlog({"t": "send_break", "umo": umo.split(":")[-1], "fail": fail,
+                            "break_min": break_min})
+            raise
+        s = self._sess(umo)
+        s["send_fail"] = 0
+        s["send_break_until"] = 0.0
 
     async def _fire(self, kind: str, template: str, only_qq: str = None) -> bool:
         """返回是否真的发出去了——调用方据此记账，没发出不销账、窗口内自动重试。
@@ -2591,6 +2837,8 @@ class DafeiyuDmPlugin(Star):
                 if only_qq and qq != only_qq:
                     continue
                 umo = f"{pid}:FriendMessage:{qq}"
+                if not self._send_open(umo, now):
+                    continue  # D7 发送熔断中：跳过该目标（不炸重试）
                 use_tpl = template
                 if (
                     kind == "random"
@@ -2962,18 +3210,22 @@ class DafeiyuDmPlugin(Star):
         "几句话，随意想。"
     )
 
-    async def _inner_monologue(self, persona_text: str, ctx: str, who: str, veto_hint: str = "") -> str:
+    async def _inner_monologue(self, persona_text: str, ctx: str, who: str, veto_hint: str = "",
+                               fh: str = "", now_line: str = "") -> str:
         """两段式第一段：无工具酝酿内心戏。产物只拼进第二段 prompt，
         不发送、不归档、不落盘（防记忆污染）。失败抛异常由调用方降级单段。
-        v1.5：veto_hint 非空时内心戏顺带做"发/不发"判断（AI 否决层，只有否决权）。"""
+        v1.5：veto_hint 非空时内心戏顺带做"发/不发"判断（AI 否决层，只有否决权）。
+        v2.5.0 F③：fh/now_line 与正文同源——前缀字节与第二段完全一致，
+        第二段调用命中第一段的前缀缓存（省一次全额输入）"""
         try:
             provider = await self.context.get_using_provider_async(None)
         except Exception:
             provider = self.context.get_using_provider()
         prompt = (
             (persona_text[:DM_PERSONA_SLICE] + "\n\n" if persona_text else "")
+            + fh
             + ctx
-            + f"[当前时间 {datetime.now().strftime('%H:%M')}]\n\n"
+            + (now_line or f"[当前时间 {datetime.now().strftime('%H:%M')}]\n\n")
             + self._INNER_TASK.replace("{who}", who)
         )
         if veto_hint:
@@ -3078,6 +3330,7 @@ class DafeiyuDmPlugin(Star):
                         inner = await self._inner_monologue(
                             persona_text, ctx, who,
                             veto_hint=self.tpl_veto_hint.replace("{who}", who),
+                            fh=fh, now_line=now_line,
                         )
                     except Exception:
                         logger.info("[主动私聊] 内心戏生成失败，本轮单段直出（否决随fail-open放行）")
@@ -3101,16 +3354,16 @@ class DafeiyuDmPlugin(Star):
                             # 双指令源挤一次冷启动生成导致的割裂
                             if not inner:
                                 try:
-                                    inner = await self._inner_monologue(persona_text, ctx, who)
+                                    inner = await self._inner_monologue(persona_text, ctx, who,
+                                                                         fh=fh, now_line=now_line)
                                 except Exception:
                                     logger.info("[主动私聊] 内心戏生成失败，本轮单段直出")
                             if inner:
-                                now2 = f"[当前时间 {datetime.now().strftime('%H:%M')}]\n\n"
                                 p2 = (
                                     (persona_text[:DM_PERSONA_SLICE] + "\n\n" if persona_text else "")
                                     + fh
                                     + ctx
-                                    + now2
+                                    + now_line
                                     + "[你刚才心里想的话（这段不会发出去，"
                                       "仅供你组织这次的表达，别复述它）]\n"
                                     + inner
