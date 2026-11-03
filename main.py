@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.5.9"
+PLUGIN_VERSION = "2.5.10"
 DM_PERSONA_SLICE = 2600  # v2.2.0：人设切片上限（旧1500装不下"唯一的"的说话规则段；主动消息日均≤7条，token 代价可忽略）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -1292,6 +1292,12 @@ class DafeiyuDmPlugin(Star):
                     s["afk"] = {"word": hit, "event": now}
                     s["afk_check"] = {"word": hit, "event": now, "text": text[:80],
                                       "rounds": self._heat_rounds(umo, now)}
+                    # v2.5.10 离席伴随承诺：同条消息带"找你"（无否定）=约了回来（"吃完找你哟"）——
+                    # 事件式前缀不在约定词表（表认时间前缀），漏网会丢回归问候加成档/履约记账/
+                    # 被晾委屈的"你明明说找我的"档
+                    if ("找你" in text and not s.get("promise")
+                            and not any(n in text for n in ("不找你", "别找你", "没找你"))):
+                        s["promise"] = {"word": hit[0] + "完找你", "event": now}
             if self.c_promise_words:
                 hit = next((w for w in self.c_promise_words if w in text), None)
                 if hit:
