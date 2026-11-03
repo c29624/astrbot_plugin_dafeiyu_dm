@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.5.0"
+PLUGIN_VERSION = "2.5.1"
 DM_PERSONA_SLICE = 2600  # v2.2.0：人设切片上限（旧1500装不下"唯一的"的说话规则段；主动消息日均≤7条，token 代价可忽略）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -1888,11 +1888,17 @@ class DafeiyuDmPlugin(Star):
             return True  # 销账：让位给冲刷
         if not self._send_open(umo, now):
             return False  # D7 发送熔断中：退避后窗口再看
-        lines = [f"[{_fmt := datetime.fromtimestamp(float(m.get('ts') or now)).strftime('%H:%M')}] {str(m.get('text') or '')[:60]}"
-                 for m in msgs[:5]]
+        lines = []
+        for m in msgs[:5]:
+            hm = datetime.fromtimestamp(float(m.get("ts") or now)).strftime("%H:%M")
+            lines.append(f"[{hm}] {str(m.get('text') or '')[:60]}")
         ctx = self._status_ctx(umo) + (
             f"[TA在你睡着时给你发了 {len(msgs)} 条留言（刚醒来才看到）：\n" + "\n".join(lines) + "]\n"
         )
+        # v2.5.1 sleep 0.8.1 联动：昨晚聊着聊着睡着（无声溜走标记在）→ 回应里自然提一句
+        ss = sl.get("silent_slip") or {}
+        if ss.get("umos") and umo in (ss.get("umos") or []):
+            ctx += "（另外你是昨晚聊着聊着直接睡着的，没来得及道别——回应里可以自然带一句，提一次就好别过度道歉）\n"
         text = await self._gen(self.tpl_morning_reply, umo=umo, kind="morning_reply",
                                veto_ok=False, veto_ctx=ctx)
         if text is None:
