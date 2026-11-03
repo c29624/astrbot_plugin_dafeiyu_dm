@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.5.1"
+PLUGIN_VERSION = "2.5.2"
 DM_PERSONA_SLICE = 2600  # v2.2.0：人设切片上限（旧1500装不下"唯一的"的说话规则段；主动消息日均≤7条，token 代价可忽略）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -132,6 +132,7 @@ DEFAULTS = {
         "（TA说了什么就接什么，该答的答、该撒娇的撒娇，按你们的相处来）。"
         "一两句，刚醒的状态自然带出来。别提任何系统或作息数字。"
     ),
+    "dm_morning_reply_map": [],     # v2.5.2 "配置ID前缀=模板" / "QQ=模板" / "default=模板"——留言回应模板按人分流（私货版给指定号，其余落全局默认）
     "dm_night2_template": (
         "你们刚才已经道过晚安（或道别）了。你现在真的躺下要睡了——"
         "按你们刚才聊天的氛围，跟{who}发一句自然的收尾：语气跟着氛围走，"
@@ -460,6 +461,17 @@ class DafeiyuDmPlugin(Star):
         self.c_cap = min(ABS_TOTAL_CAP, max(1, int(g("dm_daily_cap") or 1)))  # 硬顶7，面板填大也没用
         self.tpl_morning = str(g("dm_morning_template"))
         self.tpl_morning_reply = str(g("dm_morning_reply_template") or DEFAULTS["dm_morning_reply_template"])
+        # v2.5.2 留言回应模板按人分流（同心态段路数：QQ > 配置前缀/default > 全局默认）
+        self._mr_map = {}
+        for _item in (g("dm_morning_reply_map") or []):
+            _s2 = str(_item).strip()
+            if "=" not in _s2:
+                logger.warning(f"[主动私聊] 留言回应模板映射「{_s2}」没有=，跳过")
+                continue
+            _k2, _, _v2 = _s2.partition("=")
+            if not _v2.strip():
+                continue
+            self._mr_map[("qq:" + _k2) if _k2.strip().isdigit() else ("conf:" + _k2.strip().lower())] = _v2.strip()
         self.tpl_night = str(g("dm_night_template"))
         self.tpl_random = str(g("dm_random_template"))
         self.tpl_makeup_night = str(
@@ -1892,14 +1904,14 @@ class DafeiyuDmPlugin(Star):
         for m in msgs[:5]:
             hm = datetime.fromtimestamp(float(m.get("ts") or now)).strftime("%H:%M")
             lines.append(f"[{hm}] {str(m.get('text') or '')[:60]}")
-        ctx = self._status_ctx(umo) + (
+        ctx = self._status_ctx(umo) + self._stance_line(umo) + (
             f"[TA在你睡着时给你发了 {len(msgs)} 条留言（刚醒来才看到）：\n" + "\n".join(lines) + "]\n"
         )
         # v2.5.1 sleep 0.8.1 联动：昨晚聊着聊着睡着（无声溜走标记在）→ 回应里自然提一句
         ss = sl.get("silent_slip") or {}
         if ss.get("umos") and umo in (ss.get("umos") or []):
             ctx += "（另外你是昨晚聊着聊着直接睡着的，没来得及道别——回应里可以自然带一句，提一次就好别过度道歉）\n"
-        text = await self._gen(self.tpl_morning_reply, umo=umo, kind="morning_reply",
+        text = await self._gen(self._morning_reply_tpl(umo), umo=umo, kind="morning_reply",
                                veto_ok=False, veto_ctx=ctx)
         if text is None:
             text = random.choice(self.c_pool)  # 必发：生成失败回落语料池也不许哑
@@ -2470,6 +2482,26 @@ class DafeiyuDmPlugin(Star):
             txt = self.c_stance_hint
         txt = txt.strip()
         return f"[你的判断心态：{txt.replace('{who}', 'TA')}]\n" if txt else ""
+
+    def _morning_reply_tpl(self, umo: str) -> str:
+        """v2.5.2 留言回应模板按人分流：QQ 映射 > 配置映射(前缀/default) > 全局默认模板"""
+        if self._mr_map:
+            qq = str(umo.split(":")[-1])
+            txt = self._mr_map.get("qq:" + qq) or ""
+            if not txt:
+                cid = self._conf_of(umo)
+                if cid:
+                    txt = self._mr_map.get("conf:" + cid.lower()) or ""
+                    if not txt:
+                        for k, v in self._mr_map.items():
+                            if k.startswith("conf:") and cid.lower().startswith(k[5:]):
+                                txt = v
+                                break
+            if not txt:
+                txt = self._mr_map.get("conf:default") or ""
+            if txt:
+                return txt
+        return self.tpl_morning_reply
 
     @staticmethod
     def _cfg_write_raw(cfg: dict, key: str, value) -> bool:
