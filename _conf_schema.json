@@ -24,6 +24,54 @@
         "default": true,
         "hint": "关掉后她不再主动发任何消息（被动回复不受影响）"
       },
+      "dm_tools_morning_on": {
+        "description": "晨起·允许工具",
+        "hint": "开=晨起生成可挂载工具（模型自主决定是否使用）；关=纯文本",
+        "type": "bool",
+        "default": false
+      },
+      "dm_tools_morning_names": {
+        "description": "晨起·工具白名单",
+        "hint": "留空=全部已激活工具；填工具名=只放行这些。装了 livingmemory 可加 recall_long_term_memory，主动消息就能自己翻长期记忆。**不知道工具名？群里发 /主动私聊工具 查看**",
+        "type": "list",
+        "default": []
+      },
+      "dm_tools_night_on": {
+        "description": "睡前·允许工具",
+        "hint": "开=睡前生成可挂载工具；关=纯文本。补发通道跟随此配置",
+        "type": "bool",
+        "default": false
+      },
+      "dm_tools_night_names": {
+        "description": "睡前·工具白名单",
+        "hint": "同上",
+        "type": "list",
+        "default": []
+      },
+      "dm_tools_random_on": {
+        "description": "想你·允许工具",
+        "hint": "开=想你生成可挂载工具（比如突然想给你点首歌）；关=纯文本",
+        "type": "bool",
+        "default": false
+      },
+      "dm_tools_random_names": {
+        "description": "想你·工具白名单",
+        "hint": "同上",
+        "type": "list",
+        "default": []
+      },
+      "dm_tools_scenario_map": {
+        "description": "情景→工具许可表",
+        "hint": "每项 \"情景=工具1,工具2\"。情景标签：吃饭/聊嗨断线/等约/被晾/久别/普通。配置了该情景=白名单再与情景工具集求交集（配成空集=这情景纯文本，明确配\"这情景别带礼物\"）；不配置的情景=照常白名单。例：吃饭=deliver_music,draw_doodle",
+        "type": "list",
+        "default": []
+      },
+      "miss_prompt_tools": {
+        "description": "用工具守则（提示词补充）",
+        "hint": "拼进带工具生成的提示词，写你人设下\"什么时候该用工具\"的规矩（空=内置默认：按你的判断使用）",
+        "type": "text",
+        "default": ""
+      },
       "miss_temperament": {
         "description": "她的性格挡位",
         "hint": "懒人一步到位：平淡/正常/热情/病娇——数值全套跟挡位走；想自己调数值选\"自定义\"",
@@ -982,54 +1030,6 @@
         "hint": "开=先无工具酝酿内心戏（不发送不归档），再带着它进工具循环表达——避免任务指令+工具回执挤一次生成造成割裂。AI 否决层依赖此开关",
         "type": "bool",
         "default": true
-      },
-      "dm_tools_morning_on": {
-        "description": "晨起·允许工具",
-        "hint": "开=晨起生成可挂载工具（模型自主决定是否使用）；关=纯文本",
-        "type": "bool",
-        "default": false
-      },
-      "dm_tools_morning_names": {
-        "description": "晨起·工具白名单",
-        "hint": "留空=全部已激活工具；填工具名=只放行这些。装了 livingmemory 可加 recall_long_term_memory，主动消息就能自己翻长期记忆。**不知道工具名？群里发 /主动私聊工具 查看**",
-        "type": "list",
-        "default": []
-      },
-      "dm_tools_night_on": {
-        "description": "睡前·允许工具",
-        "hint": "开=睡前生成可挂载工具；关=纯文本。补发通道跟随此配置",
-        "type": "bool",
-        "default": false
-      },
-      "dm_tools_night_names": {
-        "description": "睡前·工具白名单",
-        "hint": "同上",
-        "type": "list",
-        "default": []
-      },
-      "dm_tools_random_on": {
-        "description": "想你·允许工具",
-        "hint": "开=想你生成可挂载工具（比如突然想给你点首歌）；关=纯文本",
-        "type": "bool",
-        "default": false
-      },
-      "dm_tools_random_names": {
-        "description": "想你·工具白名单",
-        "hint": "同上",
-        "type": "list",
-        "default": []
-      },
-      "dm_tools_scenario_map": {
-        "description": "情景→工具许可表",
-        "hint": "每项 \"情景=工具1,工具2\"。情景标签：吃饭/聊嗨断线/等约/被晾/久别/普通。配置了该情景=白名单再与情景工具集求交集（配成空集=这情景纯文本，明确配\"这情景别带礼物\"）；不配置的情景=照常白名单。例：吃饭=deliver_music,draw_doodle",
-        "type": "list",
-        "default": []
-      },
-      "miss_prompt_tools": {
-        "description": "用工具守则（提示词补充）",
-        "hint": "拼进带工具生成的提示词，写你人设下\"什么时候该用工具\"的规矩（空=内置默认：按你的判断使用）",
-        "type": "text",
-        "default": ""
       }
     }
   },

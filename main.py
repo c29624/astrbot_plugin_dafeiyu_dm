@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.5.2"
+PLUGIN_VERSION = "2.5.3"
 DM_PERSONA_SLICE = 2600  # v2.2.0：人设切片上限（旧1500装不下"唯一的"的说话规则段；主动消息日均≤7条，token 代价可忽略）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
