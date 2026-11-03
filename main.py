@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.5.4"
+PLUGIN_VERSION = "2.5.5"
 DM_PERSONA_SLICE = 2600  # v2.2.0：人设切片上限（旧1500装不下"唯一的"的说话规则段；主动消息日均≤7条，token 代价可忽略）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -1270,6 +1270,10 @@ class DafeiyuDmPlugin(Star):
             # 离席/约定词：挂在当前静默事件上（事件=act_ts 起算的静默段）
             if self.c_afk_words:
                 hit = next((w for w in self.c_afk_words if w in text), None)
+                # v2.5.5 问句排除：词前紧挨"你"=在问她（"你吃饭了吗"），不是他离席——
+                # 误锚会让回归问候演出"TA说吃饭离开"的穿帮（他没说过）；反向漏网只是少锚一次落普通档，无害
+                if hit and f"你{hit}" in text:
+                    hit = None
                 if hit:
                     s["afk"] = {"word": hit, "event": now}
                     s["afk_check"] = {"word": hit, "event": now, "text": text[:80],
