@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.5.5"
+PLUGIN_VERSION = "2.5.6"
 DM_PERSONA_SLICE = 2600  # v2.2.0：人设切片上限（旧1500装不下"唯一的"的说话规则段；主动消息日均≤7条，token 代价可忽略）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -49,6 +49,9 @@ SEEN_WHISPER_WIN = 600  # B5：掷中前 10 分钟内他在群里说过话 → �
 QUIET_HARD_LO = 8 * 60    # 评估时段硬边界 08:00
 QUIET_HARD_HI = 23 * 60 + 30  # …~23:30（风控：深夜不评估不发送）
 AFK_GRACE_MIN = 5.0  # 离席/约定词宽限：词说出后对话在5分钟内结束→仍按该档（"吃饭啦""拜拜"分开发不丢档）
+# v2.5.6 离席词第三人称主语表：词前6字窗口命中=说的是别人（"我朋友去吃饭了"），不锚他
+_AFK_THIRD_PERSON = ("他", "她", "它", "朋友", "同事", "室友", "同学", "老板", "领导", "老师",
+                     "我妈", "我爸", "妈", "爸", "父母", "别人", "人家", "大家", "哥", "姐", "弟", "妹")
 # v2.3.0 回归问候：离席词预期时长先验（分钟；被学习表中位数覆盖）
 AFK_DUR_PRIOR = {"洗澡": 45, "洗漱": 45, "吃饭": 75, "干饭": 75, "出门": 90, "取快递": 90,
                  "下班": 60, "打游戏": 150, "上课": 480, "上班": 540, "加班": 600}
@@ -1270,10 +1273,15 @@ class DafeiyuDmPlugin(Star):
             # 离席/约定词：挂在当前静默事件上（事件=act_ts 起算的静默段）
             if self.c_afk_words:
                 hit = next((w for w in self.c_afk_words if w in text), None)
-                # v2.5.5 问句排除：词前紧挨"你"=在问她（"你吃饭了吗"），不是他离席——
-                # 误锚会让回归问候演出"TA说吃饭离开"的穿帮（他没说过）；反向漏网只是少锚一次落普通档，无害
-                if hit and f"你{hit}" in text:
-                    hit = None
+                if hit:
+                    idx = text.find(hit)
+                    pre = text[max(0, idx - 6):idx]
+                    # v2.5.5 问句排除：词前紧挨"你"=在问她（"你吃饭了吗"），不是他离席——
+                    # 误锚会让回归问候演出"TA说吃饭离开"的穿帮（他没说过）
+                    # v2.5.6 第三人称排除：词前窗口里有别人（"我朋友去吃饭了"）=说别人，不是他离席
+                    # 两挡都遵循"宁可漏锚不可误锚"：漏锚只是落普通冷场档，误锚是穿帮
+                    if (f"你{hit}" in text) or any(t in pre for t in _AFK_THIRD_PERSON):
+                        hit = None
                 if hit:
                     s["afk"] = {"word": hit, "event": now}
                     s["afk_check"] = {"word": hit, "event": now, "text": text[:80],
