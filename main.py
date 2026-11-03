@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.4.0"
+PLUGIN_VERSION = "2.4.1"
 DM_PERSONA_SLICE = 2600  # v2.2.0：人设切片上限（旧1500装不下"唯一的"的说话规则段；主动消息日均≤7条，token 代价可忽略）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -2073,7 +2073,7 @@ class DafeiyuDmPlugin(Star):
         pdfm = math.exp(-0.5 * zm * zm)
         return max(0.0, min(1.0, pdf / pdfm))
 
-    def _afk_check_eval(self, umo: str, now: float, phase: str):
+    async def _afk_check_eval(self, umo: str, now: float, phase: str):
         """回归窗内逐 tick 掷（挂在 _silence_eval 之后调用）"""
         if not self.c_afk_check_on:
             return
