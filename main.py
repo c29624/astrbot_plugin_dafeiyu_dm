@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.6.0"
+PLUGIN_VERSION = "2.6.1"
 DM_PERSONA_SLICE = 999999  # v2.2.0 切片2600→v2.5.12 放开全量（用户拍板）：主动消息看完整人设，底线下沉段/语气参考不再窗外；主动消息日均≤7条，全量约+1.3K token/条，忽略不计
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -2850,8 +2850,11 @@ class DafeiyuDmPlugin(Star):
     def _pending_gates(self, umo: str, now: float, phase: str):
         """中签到点的终检。返回 (通过, 未过原因)"""
         s = self._sess(umo)
-        if float(s.get("pending", {}).get("event") or 0) != float(s.get("act_ts") or -1):
-            return False, "事件翻篇(你回来过)"  # 含活跃终检语义：任何新消息都换事件
+        # v2.6.1 修 B5 交互bug：群在场软重置把 pending 锚推到 seen_ts(>act_ts)后，
+        # 旧的 != 判定永远不相等→掷中必被误杀"你回来过"。正确语义=只有他真的在私聊
+        # 又说过话（act_ts 比 pending 锚更新）才算翻篇；seen 推前的锚不算
+        if float(s.get("act_ts") or -1) > float(s.get("pending", {}).get("event") or 0):
+            return False, "事件翻篇(你回来过)"
         if phase != "awake":
             return False, "睡着了"
         if not self._in_quiet(now):
