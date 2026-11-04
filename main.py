@@ -25,6 +25,10 @@ from types import SimpleNamespace
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+try:
+    from astrbot.api.message_components import At as _AtComp
+except Exception:
+    _AtComp = None
 from astrbot.api.star import Context, Star, register
 
 try:
@@ -33,7 +37,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.6.1"
+PLUGIN_VERSION = "2.6.2"
 DM_PERSONA_SLICE = 999999  # v2.2.0 切片2600→v2.5.12 放开全量（用户拍板）：主动消息看完整人设，底线下沉段/语气参考不再窗外；主动消息日均≤7条，全量约+1.3K token/条，忽略不计
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -1211,10 +1215,21 @@ class DafeiyuDmPlugin(Star):
         try:
             umo = str(getattr(event, "unified_msg_origin", "") or "")
             if ":GroupMessage:" in umo:
-                # v2.5.0 群在场信号：目标在任意群冒头 → seen_ts（想念钟软重置/悄悄话口吻用）
+                # v2.6.2 群在场三态（用户拍板翻转）：
+                # ①@她/回她=跟她说话→seen_chat（想念钟软重置，陪聊中不算分别，绝不吃醋）
+                # ②跟别人聊→seen（想念钟照走+掷中×1.4加成+醋口吻——"群里聊得欢都不来找我"）
                 sender = str(event.get_sender_id() or "")
                 if sender and sender in self._target_qqs():
-                    self._st.setdefault("seen", {})[sender] = time.time()
+                    talked = False
+                    if _AtComp is not None:
+                        try:
+                            sid = str(event.get_self_id())
+                            talked = any(isinstance(c, _AtComp) and str(getattr(c, "qq", "")) == sid
+                                         for c in event.get_messages())
+                        except Exception:
+                            talked = False
+                    key = "seen_chat" if talked else "seen"
+                    self._st.setdefault(key, {})[sender] = time.time()
                 return
             if ":FriendMessage:" not in umo:
                 return
@@ -1940,6 +1955,7 @@ class DafeiyuDmPlugin(Star):
                 data = {"date": today, "umos": []}
             if umo not in data["umos"]:
                 data["umos"].append(umo)
+            p.parent.mkdir(parents=True, exist_ok=True)  # sleep 目录可能不存在（新装/迁移）——建了再写
             p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         except Exception:
             logger.info("[主动私聊] 留言回应标记文件写入失败（sleep 侧会重复冲刷，无功能损害）")
@@ -2747,11 +2763,11 @@ class DafeiyuDmPlugin(Star):
             ev = float(s.get("act_ts") or 0)
             if not ev:
                 continue  # 从没说过话：无静默可言
-            # v2.5.0 B5 群在场软重置：他在群里冒过头=不算分别，静默钟从群活动重起
-            # （hazard 不照"消失N小时"累积；不并入活跃闸门——群聊中私聊戳一句是真人行为）
-            seen = float((self._st.get("seen") or {}).get(qq) or 0)
-            if seen > ev:
-                ev = seen
+            # v2.6.2 B5 翻转：只有@她的群聊(seen_chat)才算"陪聊中不算分别"软重置；
+            # 跟别人聊(seen)不重置——人就在那儿却不找她，钟照走（掷中侧另有×1.4加成+醋口吻）
+            seen_chat = float((self._st.get("seen_chat") or {}).get(qq) or 0)
+            if seen_chat > ev:
+                ev = seen_chat
             # ① 中签 pending 的到点处理
             pend = s.get("pending")
             if pend and now >= float(pend.get("at") or 0):
@@ -2801,6 +2817,12 @@ class DafeiyuDmPlugin(Star):
             if random.random() >= p_haz:
                 continue
             p, factors = self._miss_probability(umo, tier, rounds)
+            # v2.6.2 群冷落加成：他刚在群里跟别人聊过（10分钟内，非@她）——人就在屏幕前，
+            # 发消息零打扰所以敢发；"跟别人聊却不找她"的酸味在发送侧口吻里
+            seen = float((self._st.get("seen") or {}).get(qq) or 0)
+            if 0 < now - seen < SEEN_WHISPER_WIN:
+                p = min(1.0, p * 1.4)
+                factors["grp_seen"] = 1.4
             if attempt == 1:
                 # 本事件总次数随热度抽（聊得越热她想起你的次数越多；抽的，观察不出固定数）
                 if rounds >= self.c_heat_hot_min:
@@ -2886,11 +2908,15 @@ class DafeiyuDmPlugin(Star):
         extra_ctx = ""
         if tag == "睡醒后还没说过话":
             extra_ctx = "（你睡醒到现在还没主动跟TA说过话，这条开口自然带点刚醒的感觉，不用硬找话题）\n"
-        # v2.5.0 B5 悄悄话口吻：掷中前他还在群里说话 → 私聊这条像凑过去悄悄说
+        # v2.6.2 B5 翻转后的口吻：他刚在群里跟别人聊得欢（非@她）→ 醋味冷落档——
+        # "人就在那儿跟别人聊，却不来找我"是冷落信号不是宽慰，戳一句带酸
         qq = str(umo.split(":")[-1])
         seen = float((self._st.get("seen") or {}).get(qq) or 0)
         if seen and 0 < now - seen < SEEN_WHISPER_WIN:
-            extra_ctx += "（TA这会儿正在群里聊着天，你这条是私聊发的——像凑到耳边悄悄说，可以带点\"群里不方便说\"的意味）\n"
+            _priv_gap = max(0.0, (now - float(s.get("act_ts") or now)) / 3600)
+            extra_ctx += (f"（TA这会儿正在群里跟别人聊得欢，你们私聊已经 {_priv_gap:.0f} 小时没说话了——"
+                          "你这条是私聊发的，像凑过去小声说一句，可以带点酸：群里聊那么欢都不来找我，"
+                          "但别真吵架，傲娇的小委屈那种）\n")
         if self.c_gen_mode.get("random") == "template":
             text = random.choice(self.c_pool)
             status = "ok"
