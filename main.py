@@ -37,7 +37,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.6.2"
+PLUGIN_VERSION = "2.6.3"
 DM_PERSONA_SLICE = 999999  # v2.2.0 切片2600→v2.5.12 放开全量（用户拍板）：主动消息看完整人设，底线下沉段/语气参考不再窗外；主动消息日均≤7条，全量约+1.3K token/条，忽略不计
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -147,6 +147,7 @@ DEFAULTS = {
     ),
     "dm_morning_reply_map": [],     # v2.5.2 "配置ID前缀=模板" / "QQ=模板" / "default=模板"——留言回应模板按人分流（私货版给指定号，其余落全局默认）
     "dm_day_cut_on": False,        # v2.6.0 日切：醒来开新对话+昨日摘要种子（公共默认关，实例按需开）
+    "dm_group_at_counts": True,    # v2.6.3 群里@她算不算"理她"：开=群聊陪她想念钟重置；关=群聊不算私聊陪伴，她照常来私聊找你
     "dm_day_cut_seed_template": (
         "你在把一段用户与AI角色的私聊记录浓缩成次日记忆摘要，这段摘要会成为她新一天醒来时的记忆。"
         "用中文按时间顺序写成要点，全文控制在1000字内。必须保留：①用户的个人信息与喜好"
@@ -485,6 +486,7 @@ class DafeiyuDmPlugin(Star):
         self.tpl_morning = str(g("dm_morning_template"))
         self.tpl_morning_reply = str(g("dm_morning_reply_template") or DEFAULTS["dm_morning_reply_template"])
         self.c_day_cut = bool(g("dm_day_cut_on"))
+        self.c_group_at_counts = bool(g("dm_group_at_counts"))
         self.tpl_seed = str(g("dm_day_cut_seed_template") or DEFAULTS["dm_day_cut_seed_template"])
         # v2.5.2 留言回应模板按人分流（同心态段路数：QQ > 配置前缀/default > 全局默认）
         self._mr_map = {}
@@ -2765,8 +2767,9 @@ class DafeiyuDmPlugin(Star):
                 continue  # 从没说过话：无静默可言
             # v2.6.2 B5 翻转：只有@她的群聊(seen_chat)才算"陪聊中不算分别"软重置；
             # 跟别人聊(seen)不重置——人就在那儿却不找她，钟照走（掷中侧另有×1.4加成+醋口吻）
+            # v2.6.3 开关：用户可裁定"群里@她算不算理她"——关=群聊不算私聊陪伴，钟照走
             seen_chat = float((self._st.get("seen_chat") or {}).get(qq) or 0)
-            if seen_chat > ev:
+            if self.c_group_at_counts and seen_chat > ev:
                 ev = seen_chat
             # ① 中签 pending 的到点处理
             pend = s.get("pending")
@@ -2911,6 +2914,12 @@ class DafeiyuDmPlugin(Star):
         # v2.6.2 B5 翻转后的口吻：他刚在群里跟别人聊得欢（非@她）→ 醋味冷落档——
         # "人就在那儿跟别人聊，却不来找我"是冷落信号不是宽慰，戳一句带酸
         qq = str(umo.split(":")[-1])
+        seen_chat = float((self._st.get("seen_chat") or {}).get(qq) or 0)
+        if (not self.c_group_at_counts) and seen_chat and 0 < now - seen_chat < SEEN_WHISPER_WIN:
+            _priv_gap = max(0.0, (now - float(s.get("act_ts") or now)) / 3600)
+            extra_ctx += (f"（你们刚在群里聊过，但私聊已经 {_priv_gap:.0f} 小时没说话了——群里的热闹不算数，"
+                          "你想要他来私聊找你，这条可以带点这个意思，比如群里太吵、有话想单独跟他说，"
+                          "不委屈不吵架，就是想要私聊）\n")
         seen = float((self._st.get("seen") or {}).get(qq) or 0)
         if seen and 0 < now - seen < SEEN_WHISPER_WIN:
             _priv_gap = max(0.0, (now - float(s.get("act_ts") or now)) / 3600)
