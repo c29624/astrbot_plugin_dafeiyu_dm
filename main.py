@@ -33,7 +33,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.5.12"
+PLUGIN_VERSION = "2.6.0"
 DM_PERSONA_SLICE = 999999  # v2.2.0 切片2600→v2.5.12 放开全量（用户拍板）：主动消息看完整人设，底线下沉段/语气参考不再窗外；主动消息日均≤7条，全量约+1.3K token/条，忽略不计
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -46,6 +46,11 @@ SEND_FAIL_N = 3
 SEND_BREAK_BASE_MIN = 30
 SEND_BREAK_CAP_MIN = 12 * 60
 SEEN_WHISPER_WIN = 600  # B5：掷中前 10 分钟内他在群里说过话 → 悄悄话口吻
+# v2.6.0 日切：醒来开新对话+昨日摘要种子（F②落地——治"每条消息驮全部历史"的账单锯齿）
+DAY_CUT_WAKE_WINDOW = 6 * 3600   # 醒后多久内可切（错过窗口=当天不切）
+DAY_CUT_MIN_HIST = 20            # 昨天少于这个条数不值得摘要，直接销账不切
+DAY_CUT_RETRY_MIN = 10           # 种子生成失败重试间隔（分钟）
+DAY_CUT_MAX_TRIES = 12           # 最多重试 12 次≈2 小时，全失败回落旧行为（记忆无损）
 QUIET_HARD_LO = 8 * 60    # 评估时段硬边界 08:00
 QUIET_HARD_HI = 23 * 60 + 30  # …~23:30（风控：深夜不评估不发送）
 AFK_GRACE_MIN = 5.0  # 离席/约定词宽限：词说出后对话在5分钟内结束→仍按该档（"吃饭啦""拜拜"分开发不丢档）
@@ -137,6 +142,16 @@ DEFAULTS = {
         "一两句，刚醒的状态自然带出来。别提任何系统或作息数字。"
     ),
     "dm_morning_reply_map": [],     # v2.5.2 "配置ID前缀=模板" / "QQ=模板" / "default=模板"——留言回应模板按人分流（私货版给指定号，其余落全局默认）
+    "dm_day_cut_on": False,        # v2.6.0 日切：醒来开新对话+昨日摘要种子（公共默认关，实例按需开）
+    "dm_day_cut_seed_template": (
+        "你在把一段用户与AI角色的私聊记录浓缩成次日记忆摘要，这段摘要会成为她新一天醒来时的记忆。"
+        "用中文按时间顺序写成要点，全文控制在1000字内。必须保留：①用户的个人信息与喜好"
+        "（称呼、习惯、最近在忙的事、喜欢和讨厌的东西）；②双方的约定、承诺、待办和已定的提醒"
+        "（含具体日期时间）；③聊到一半还没收尾的话题（今天要能接得上）；④两人关系的进展和情绪事件"
+        "（和好、闹别扭、说开的心事、气氛变化）；⑤只有两人懂的梗、玩笑和专属叫法。"
+        "空间不够按上面顺序取舍。纯寒暄、已完成的琐事略去。如果记录里已有旧摘要，"
+        "把新内容合并进旧摘要更新它。不要写成流水账，写成「发生了什么、定了什么、还差什么」。"
+    ),     # v2.5.2 "配置ID前缀=模板" / "QQ=模板" / "default=模板"——留言回应模板按人分流（私货版给指定号，其余落全局默认）
     "dm_night2_template": (
         "你们刚才已经道过晚安（或道别）了。你现在真的躺下要睡了——"
         "按你们刚才聊天的氛围，跟{who}发一句自然的收尾：语气跟着氛围走，"
@@ -465,6 +480,8 @@ class DafeiyuDmPlugin(Star):
         self.c_cap = min(ABS_TOTAL_CAP, max(1, int(g("dm_daily_cap") or 1)))  # 硬顶7，面板填大也没用
         self.tpl_morning = str(g("dm_morning_template"))
         self.tpl_morning_reply = str(g("dm_morning_reply_template") or DEFAULTS["dm_morning_reply_template"])
+        self.c_day_cut = bool(g("dm_day_cut_on"))
+        self.tpl_seed = str(g("dm_day_cut_seed_template") or DEFAULTS["dm_day_cut_seed_template"])
         # v2.5.2 留言回应模板按人分流（同心态段路数：QQ > 配置前缀/default > 全局默认）
         self._mr_map = {}
         for _item in (g("dm_morning_reply_map") or []):
@@ -1164,6 +1181,13 @@ class DafeiyuDmPlugin(Star):
             umo = str(getattr(event, "unified_msg_origin", "") or "")
             if ":FriendMessage:" not in umo:
                 return
+            # v2.6.0 日切种子省缓存：捕获主对话真实系统提示词——种子调用复用同前缀，
+            # 50K 历史走缓存价而不是全价（自动跟随平台怎么拼系统头，平台更新零适配）
+            _sp = str(getattr(req, "system_prompt", "") or "")
+            if _sp:
+                if not hasattr(self, "_cap_sys"):
+                    self._cap_sys = {}
+                self._cap_sys[umo] = _sp
             now = time.time()
             blocks = []
             s = self._sess(umo)
@@ -1744,6 +1768,10 @@ class DafeiyuDmPlugin(Star):
         now = time.time()
         phase = self._sleep_phase()
         sl = self._sleep_state() or {}
+
+        # ---------- v2.6.0 日切（醒来开新对话+昨日种子；必须在晨起/留言回应之前） ----------
+        if self.c_day_cut:
+            await self._day_cut_eval(now, phase)
 
         # ---------- 晨起（v2.5.0 per-umo：每个目标自己的计划/掷骰/发送；留言回应线） ----------
         if self.c_morning:
@@ -2512,6 +2540,103 @@ class DafeiyuDmPlugin(Star):
             txt = self.c_stance_hint
         txt = txt.strip()
         return f"[你的判断心态：{txt.replace('{who}', 'TA')}]\n" if txt else ""
+
+    # ---------- v2.6.0 日切 ----------
+
+    async def _day_cut_eval(self, now: float, phase: str):
+        """醒后窗口内做当日日切（每目标一次）：种子成功才切（原子性）；失败按 10 分钟重试至
+        2 小时，全失败回落旧行为（当天不切，记忆无损，账单=旧水平）；昨天没聊够不折腾"""
+        if phase != "awake":
+            return  # 临时清醒不切——只认真正醒了
+        sl = self._sleep_state() or {}
+        wake_ts = float(sl.get("wake_at") or 0)
+        if not wake_ts or now - wake_ts > DAY_CUT_WAKE_WINDOW:
+            return  # 没醒过/醒太久（重启错过窗口）=当天不切
+        wday = datetime.fromtimestamp(wake_ts).date().isoformat()
+        cuts = self._st.setdefault("day_cut", {})
+        for umo in self._target_umos():
+            st = cuts.get(umo) or {}
+            if st.get("date") == wday and (st.get("cut") or st.get("gave_up")):
+                continue  # 今天已切/已放弃
+            if st.get("date") != wday:
+                st = {"date": wday, "cut": False, "gave_up": False, "tries": 0, "next_at": 0.0}
+            if now < float(st.get("next_at") or 0):
+                continue
+            st["tries"] = int(st.get("tries") or 0) + 1
+            try:
+                ok, noop = await self._day_cut_one(umo)
+            except Exception:
+                logger.warning("[主动私聊] 日切异常（今日回落旧行为，记忆无损）", exc_info=True)
+                ok, noop = False, False
+            if ok:
+                st["cut"] = True
+                self._dlog({"t": "day_cut", "umo": umo.split(":")[-1], "noop": noop,
+                            "tries": st["tries"]})
+            elif noop:
+                st["cut"] = True  # 昨天没聊够：销账不折腾
+            elif st["tries"] >= DAY_CUT_MAX_TRIES:
+                st["gave_up"] = True
+                self._dlog({"t": "day_cut_giveup", "umo": umo.split(":")[-1],
+                            "why": "种子重试2小时全失败,当日回落旧行为"})
+            else:
+                st["next_at"] = now + DAY_CUT_RETRY_MIN * 60
+            cuts[umo] = st
+            self._save_state()
+
+    async def _day_cut_one(self, umo: str) -> tuple:
+        """对单个目标执行日切。返回 (成功?, 无需切?)。原子性：种子生成成功才建新对话——
+        绝不存在'新对话空了、旧对话又丢上下文'的中间态。旧对话留在库里（可回滚）"""
+        cm = self.context.conversation_manager
+        cid = await cm.get_curr_conversation_id(umo)
+        if not cid:
+            return True, True  # 从没聊过：无对话可切
+        conv = await cm.get_conversation(umo, cid)
+        history = getattr(conv, "history", None)
+        if isinstance(history, str):
+            history = json.loads(history)
+        if not isinstance(history, list) or len(history) < DAY_CUT_MIN_HIST:
+            return True, True  # 昨天没聊几条：上下文本来就小，不折腾
+        summary = await self._gen_seed(umo, history)
+        if not summary:
+            return False, False  # 种子失败：不切（调用方安排重试）
+        seed_msg = {"role": "user", "content":
+                    "[系统标记：你睡醒后对昨天的记忆——自然记得的梗概，不是TA刚发的消息]\n" + summary}
+        await cm.new_conversation(
+            umo, content=[seed_msg],
+            persona_id=getattr(conv, "persona_id", None))
+        return True, False
+
+    async def _gen_seed(self, umo: str, history: list) -> str:
+        """昨日摘要：优先复用主对话真实系统提示词+原生 history 走 provider——前缀与主对话
+        同字节，50K 历史吃缓存价（种子从全价4毛降到分位）；没捕获过系统头则裸调（全价兜底）"""
+        try:
+            try:
+                provider = await self.context.get_using_provider_async(None)
+            except Exception:
+                provider = self.context.get_using_provider()
+            if provider is None:
+                return ""
+            instr = self.tpl_seed
+            sys_cap = (getattr(self, "_cap_sys", None) or {}).get(umo) or ""
+            if sys_cap:
+                resp = await asyncio.wait_for(
+                    provider.text_chat(prompt=instr, session_id=f"{PLUGIN_NAME}_seed",
+                                       contexts=history, system_prompt=sys_cap),
+                    timeout=180)
+            else:
+                lines = []
+                for m in history:
+                    if isinstance(m, dict):
+                        who = "她" if m.get("role") == "assistant" else "TA"
+                        lines.append(f"{who}: {self._record_text(m.get('content', ''))[:200]}")
+                resp = await asyncio.wait_for(
+                    provider.text_chat(prompt=instr + "\n\n聊天记录：\n" + "\n".join(lines),
+                                       session_id=f"{PLUGIN_NAME}_seed"),
+                    timeout=180)
+            return str(getattr(resp, "completion_text", "") or "").strip()[:1500]
+        except Exception:
+            logger.warning("[主动私聊] 昨日种子生成失败（将重试，未切对话）", exc_info=True)
+            return ""
 
     def _morning_reply_tpl(self, umo: str) -> str:
         """v2.5.2 留言回应模板按人分流：QQ 映射 > 配置映射(前缀/default) > 全局默认模板"""
