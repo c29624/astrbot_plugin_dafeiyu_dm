@@ -37,7 +37,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.7.1"
+PLUGIN_VERSION = "2.7.2"
 DM_PERSONA_SLICE = 999999  # v2.2.0 切片2600→v2.5.12 放开全量（用户拍板）：主动消息看完整人设，底线下沉段/语气参考不再窗外；主动消息日均≤7条，全量约+1.3K token/条，忽略不计
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -1286,18 +1286,36 @@ class DafeiyuDmPlugin(Star):
                     s["t_warm_before"] = tw
                 s["_reunion_due"] = True
                 s["_reunion_gap"] = now - float(prev_msgs[-1])
-            # v2.7.0 履约/短暂回归（锚感知，替代 2.3.0 的 6h 限时版）：
-            # 锚到/过了他回来=赴约：kept 记履约率 + 实际等待记学习样本（从最后一条消息起算，
-            #   卫生两道闸：<5min 丢弃（顺口一句不算）/ >先验×2.5 丢弃（隔夜换天自动挡））；
-            # 锚前冒泡=短暂回归（游戏里死亡回城顺口回一句）：不销约不记履约——
-            #   活动词重锚（忙碌钟从他这刻重走）、时刻词只刷新宽限（"晚上"不因冒泡挪窝）
+            # v2.7.2 赴约三档（用户 2026-11-05 拍板"就算没有两小时也不能不算赴约"）：
+            # ①锚到/过了回来=赴约；②锚前聊起来（超5分钟或≥3条）=提前赴约——人到了就是
+            #   到了，等待样本=出发→他回来第一条；③锚前冒泡（≤5分钟且≤2条，游戏回城
+            #   顺口回一句）=约保留、活动词锚顺延。冒泡轮间隔超宽限=两回事，重开一轮
             pl = s.get("promise") or {}
             if pl.get("word"):
-                if now >= self._anchor_of(pl) - AFK_GRACE_MIN * 60:
+                _grace = AFK_GRACE_MIN * 60
+                back_at = float(pl.get("back_at") or 0)
+                if back_at and now - prev_act > _grace:
+                    pl.pop("back_at", None)   # 上一轮冒泡早结束了：清账重开一轮
+                    pl.pop("back_from", None)
+                    pl.pop("back_n", None)
+                    back_at = 0
+                if now >= self._anchor_of(pl) - _grace:
+                    substantive = True
+                elif not back_at:
+                    pl["back_at"], pl["back_from"], pl["back_n"] = now, prev_act, 1
+                    substantive = False
+                elif now - back_at > _grace or int(pl.get("back_n") or 1) >= 2:
+                    substantive = True  # 锚前就聊起来了 = 提前赴约
+                else:
+                    pl["back_n"] = int(pl.get("back_n") or 1) + 1
+                    substantive = False
+                if substantive:
+                    first_back = float(pl.get("back_at") or now)
+                    dep = float(pl.get("back_from") or prev_act)
+                    gap = first_back - dep
                     log = (s.setdefault("promise_log", []) or [])[-10:]
                     log.append({"word": pl["word"], "at": now, "kept": True})
                     s["promise_log"] = log[-10:]
-                    gap = now - prev_act
                     prior = self._promise_prior_min(pl["word"])
                     if 5 * 60 < gap < prior * 2.5 * 60:
                         self._st.setdefault("afk_dur_learn", {}).setdefault(pl["word"], []).append(round(gap / 60, 1))
@@ -1306,7 +1324,8 @@ class DafeiyuDmPlugin(Star):
                             self._st["afk_dur_learn"][pl["word"]] = lst[-10:]
                     s["promise"] = None
                     self._dlog({"t": "promise_kept", "umo": umo.split(":")[-1],
-                                "word": pl["word"], "gap_min": round(gap / 60, 1)})
+                                "word": pl["word"], "gap_min": round(gap / 60, 1),
+                                "early": back_at > 0})
                 else:
                     pl["event"] = now
                     if pl.get("kind") != "time":
