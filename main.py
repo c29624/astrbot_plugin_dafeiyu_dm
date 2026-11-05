@@ -37,7 +37,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.6.4"
+PLUGIN_VERSION = "2.7.0"
 DM_PERSONA_SLICE = 999999  # v2.2.0 切片2600→v2.5.12 放开全量（用户拍板）：主动消息看完整人设，底线下沉段/语气参考不再窗外；主动消息日均≤7条，全量约+1.3K token/条，忽略不计
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -71,6 +71,18 @@ AFK_CHECK_WIN_MIN = 90            # 回归窗宽（分钟）
 AFK_CHECK_PEAK_MIN = 20           # 对数正态 hazard 峰位（开窗后分钟）
 AFK_CHECK_SIGMA = 0.6             # 对数正态 σ
 INTENT_POOL_PROMISE = (1.2, 1.5)  # 约定在身掷骰池（明确契约，冷热少打折）
+# v2.7.0 约的锚点三分类 + 重掷间隔乘子（2026-11-05 用户拍板"做全套"，设计稿=dm_v270_有约锚点_设计文档.md）
+VAGUE_DUR_PRIOR = {"等会": 45, "等下": 45, "一会": 45, "待会": 45, "晚点": 90, "稍后": 90,
+                   "回来": 90, "回头": 150, "过后": 150, "弄完": 150}  # 模糊词梯度先验（分钟）
+PROMISE_TIME_WORDS = ("晚上", "今晚", "夜里", "傍晚")   # 时刻词："晚上找你"→今晚钟点锚
+PROMISE_TIME_WIN = (19 * 60, 20 * 60)                  # 时刻词锚窗：19:00~20:00 随机一分钟
+PROMISE_EXPIRE_H = 2.0            # 锚过这小时数还没等到人：销约（缺席留痕）
+RETRY_MULT_HEAT = (0.45, 0.7, 1.0)   # 重掷间隔乘子：热/中/冷
+RETRY_MULT_PROMISE = 0.4             # 有约在身：念想重得快
+RETRY_MULT_FREE = 0.6                # 空闲日：闲着更容易想起来
+RETRY_FLOOR_MIN = 45                 # 重掷间隔下限（分钟）
+ANCHOR_MOOD_HI, ANCHOR_MOOD_LO = 1.05, 0.90   # 心情挪锚阈值（只动时机不动概率）
+ANCHOR_MOOD_FAST, ANCHOR_MOOD_SLOW = 0.7, 1.5  # 高涨→锚提前30% / 蔫→推后50%
 # 普通/告别池随 T 弹性：c_plain=0.55+0.3T / c_bye=min(0.35+0.5T,0.7)，池=c±0.1，告别顶钳 0.8
 REUNION_E_LO, REUNION_E_HI = 6 * 3600, 36 * 3600   # 重逢 E_eff 钳位（秒）
 REUNION_TIERS = ((2, 48 * 3600, 72 * 3600),        # (倍数, 绝对下限, 绝对上限) 轻哼 2~3 天
@@ -1097,8 +1109,10 @@ class DafeiyuDmPlugin(Star):
         # v1.7.0 按人区分的当日计数/每人微扰跨天清零（每人微扰当日懒掷，见 _drift_vals）
         self._st["per"] = {}
         self._st["pdrift"] = {}
-        # 心情节律：多日随机游走 ±15%，夹在 [0.85, 1.15]
-        mood = float(self._st.get("mood", 1.0)) + random.uniform(-MOOD_STEP, MOOD_STEP)
+        # 心情节律：v2.7.0 方案⑤修正版——AR(1) 正向情绪惯性（φ=0.7 向基线 1.0 回归）+每日
+        # 新扰动 ±15%：真人情绪日间自相关为正（Kuppens 情绪惯性研究），昨天高涨今天
+        # 更容易偏高、几天内自然淡回平常——不是"昨天密今天必冷"的机械负相关
+        mood = 1.0 + 0.7 * (float(self._st.get("mood", 1.0)) - 1.0) + random.uniform(-MOOD_STEP, MOOD_STEP)
         self._st["mood"] = round(min(1 + MOOD_STEP, max(1 - MOOD_STEP, mood)), 3)
         # 夜聊频率滑窗：只留最近 8 天
         nc = self._st.get("night_chat") or {}
@@ -1232,6 +1246,9 @@ class DafeiyuDmPlugin(Star):
                             talked = False
                     key = "seen_chat" if talked else "seen"
                     self._st.setdefault(key, {})[sender] = time.time()
+                    # v2.7.0 群@=见面（开关开时）：销约销离席+中签作废——跟 dm_group_at_counts 走
+                    if talked and self.c_group_at_counts:
+                        self._grp_meet_clear(sender, str(umo.split(":")[0]))
                 return
             if ":FriendMessage:" not in umo:
                 return
@@ -1265,13 +1282,38 @@ class DafeiyuDmPlugin(Star):
                     s["t_warm_before"] = tw
                 s["_reunion_due"] = True
                 s["_reunion_gap"] = now - float(prev_msgs[-1])
-            # v2.3.0 promise 履约记录：约定后 6h 内他来了=kept（喂 T 履约率）
+            # v2.7.0 履约/短暂回归（锚感知，替代 2.3.0 的 6h 限时版）：
+            # 锚到/过了他回来=赴约：kept 记履约率 + 实际等待记学习样本（从最后一条消息起算，
+            #   卫生两道闸：<5min 丢弃（顺口一句不算）/ >先验×2.5 丢弃（隔夜换天自动挡））；
+            # 锚前冒泡=短暂回归（游戏里死亡回城顺口回一句）：不销约不记履约——
+            #   活动词重锚（忙碌钟从他这刻重走）、时刻词只刷新宽限（"晚上"不因冒泡挪窝）
             pl = s.get("promise") or {}
-            if pl.get("word") and 0 < now - float(pl.get("event") or 0) <= 6 * 3600:
-                log = (s.setdefault("promise_log", []) or [])[-10:]
-                log.append({"word": pl["word"], "at": now, "kept": True})
-                s["promise_log"] = log[-10:]
-                s["promise"] = None
+            if pl.get("word"):
+                if now >= self._anchor_of(pl) - AFK_GRACE_MIN * 60:
+                    log = (s.setdefault("promise_log", []) or [])[-10:]
+                    log.append({"word": pl["word"], "at": now, "kept": True})
+                    s["promise_log"] = log[-10:]
+                    gap = now - prev_act
+                    prior = self._promise_prior_min(pl["word"])
+                    if 5 * 60 < gap < prior * 2.5 * 60:
+                        self._st.setdefault("afk_dur_learn", {}).setdefault(pl["word"], []).append(round(gap / 60, 1))
+                        lst = self._st["afk_dur_learn"][pl["word"]]
+                        if len(lst) > 10:
+                            self._st["afk_dur_learn"][pl["word"]] = lst[-10:]
+                    s["promise"] = None
+                    self._dlog({"t": "promise_kept", "umo": umo.split(":")[-1],
+                                "word": pl["word"], "gap_min": round(gap / 60, 1)})
+                else:
+                    pl["event"] = now
+                    if pl.get("kind") != "time":
+                        pl["anchor"] = self._make_anchor_ts(pl["word"], now)
+                        pl["kind"] = "dur"
+                    self._dlog({"t": "promise_touch", "umo": umo.split(":")[-1], "word": pl["word"]})
+            # v2.7.0 缺席留痕兜底：销约后当晚他还是来了 → 次日"没等到"的提一嘴作废
+            tr = (self._st.get("miss_trace") or {}).get(umo)
+            if tr and not tr.get("said") and now - float(tr.get("ts") or 0) < 24 * 3600:
+                tr["said"] = True
+                self._dlog({"t": "trace_cancel", "umo": umo.split(":")[-1]})
             s["msg_times"] = prev_msgs + [now]
             cut = now - 26 * 3600
             s["msg_times"] = [t for t in s["msg_times"] if t >= cut]
@@ -1338,11 +1380,15 @@ class DafeiyuDmPlugin(Star):
                     # 被晾委屈的"你明明说找我的"档
                     if ("找你" in text and not s.get("promise")
                             and not any(n in text for n in ("不找你", "别找你", "没找你"))):
-                        s["promise"] = {"word": hit[0] + "完找你", "event": now}
+                        pw = hit + "完找你"
+                        s["promise"] = {"word": pw, "event": now, "kind": "dur",
+                                        "anchor": self._make_anchor_ts(pw, now)}
             if self.c_promise_words:
                 hit = next((w for w in self.c_promise_words if w in text), None)
                 if hit:
-                    s["promise"] = {"word": hit, "event": now}
+                    s["promise"] = {"word": hit, "event": now,
+                                    "kind": self._promise_kind(hit),
+                                    "anchor": self._make_anchor_ts(hit, now)}
             # 你先道了别：记下时刻（起点时刻后算数，防白天误伤）——她睡得再晚，躺下也必收尾
             if self.c_night_words:
                 dt = datetime.fromtimestamp(now)
@@ -1526,7 +1572,9 @@ class DafeiyuDmPlugin(Star):
         grace = AFK_GRACE_MIN * 60
         # 词的event是"说出词那条消息"的时刻；分开发"吃饭啦""拜拜"时最后一条≠说词条
         # ——距词不超过宽限期仍认（聊超过宽限才安静=人没走，回落普通档）
-        if promise and 0 <= ev - float(promise.get("event") or -1) <= grace:
+        # v2.7.0 锚感知：约活着（锚未过期）就是约档——锚前她不瞎找（掷骰侧把静默钟
+        # 压到 0），锚后到销约前这窗是"该回来了还没回"的念想高峰
+        if promise and now < self._anchor_of(promise) + PROMISE_EXPIRE_H * 3600:
             tier = "promise"   # 约定未赴 → 中档
         elif afk and 0 <= ev - float(afk.get("event") or -1) <= grace:
             tier = "afk"       # 离席词 → 吃饭档
@@ -2181,8 +2229,19 @@ class DafeiyuDmPlugin(Star):
                     datetime.fromtimestamp(float(afk.get("event") or act)).strftime("%H:%M"), afk["word"])
             promise = s.get("promise") or {}
             if isinstance(promise, dict) and promise.get("word"):
-                anchor += "，约过 {}「{}」还没兑现".format(
-                    datetime.fromtimestamp(float(promise.get("event") or act)).strftime("%H:%M"), promise["word"])
+                pa = self._anchor_of(promise)
+                _pmin = int((pa - now) // 60)
+                if _pmin > 5:
+                    anchor += "，约过 {}「{}」还没兑现——按说 {} 前后该忙完来找你（还有约 {} 分钟）".format(
+                        datetime.fromtimestamp(float(promise.get("event") or act)).strftime("%H:%M"),
+                        promise["word"], datetime.fromtimestamp(pa).strftime("%H:%M"), _pmin)
+                elif _pmin >= -PROMISE_EXPIRE_H * 60:
+                    anchor += "，约过 {}「{}」——按说这会儿刚忙完，该回来了".format(
+                        datetime.fromtimestamp(float(promise.get("event") or act)).strftime("%H:%M"),
+                        promise["word"])
+                else:
+                    anchor += "，约过 {}「{}」还没兑现".format(
+                        datetime.fromtimestamp(float(promise.get("event") or act)).strftime("%H:%M"), promise["word"])
             parts.append(f"距TA最后一条消息已 {gap}{anchor}")
         rounds = self._heat_rounds(umo, now)
         span = self._heat_span(umo, now)
@@ -2204,6 +2263,14 @@ class DafeiyuDmPlugin(Star):
             parts.append("你现在很困（话少、反应慢，困得有点撑不住）")
         elif dl == 1:
             parts.append("你现在有点困")
+        # v2.7.0 缺席留痕（抗规律感①）：几小时前的约没等到人、她也没去找他 → 感官包
+        # 带上这一嘴的事实，她开口自然提（轻轻的，不兴师问罪）；他后来回来了/她提过了就不再带
+        tr = (self._st.get("miss_trace") or {}).get(umo)
+        if tr and not tr.get("said") and now - float(tr.get("ts") or 0) > 6 * 3600:
+            _td = (now - float(tr.get("ts") or 0)) / 3600
+            _when = "刚才" if _td < 14 else ("昨天" if _td < 36 else "前两天")
+            parts.append(f"{_when}TA说「{tr.get('word')}」结果一直没来，你也没等到——"
+                         "现在开口可以自然带一嘴这事，轻轻的，不兴师问罪")
         parts.append(f"今日已主动 {int(self._st.get('sent_total', 0))} 条；现在 {datetime.now().strftime('%H:%M')}")
         return "[背景事实：" + "；".join(parts) + "]\n"
 
@@ -2278,6 +2345,65 @@ class DafeiyuDmPlugin(Star):
         tw[umo] = {"rounds": r_rounds, "freq": r_freq, "keep": keep, "t": t,
                    "ts": time.time(), "at": datetime.now().strftime("%m-%d %H:%M")}
         return t
+
+    # ---------- v2.7.0 约的锚点（三分类：时刻词/活动词/模糊词） ----------
+
+    def _promise_kind(self, word: str) -> str:
+        """时刻词→time（锚=今晚钟点，冒泡不挪窝）；其余→dur（锚=说话时刻+预期时长）"""
+        w = str(word)
+        return "time" if any(w.startswith(t) or t in w[:3] for t in PROMISE_TIME_WORDS) else "dur"
+
+    def _promise_prior_min(self, word: str) -> float:
+        """该约词的先验时长（分钟）：配置覆盖 > 活动词先验（"打游戏完找你"→150）
+        > 模糊词梯度（等会45/晚点90/回头150）> 90 兜底"""
+        w = str(word)
+        if w in self.c_afk_dur_map:
+            return float(self.c_afk_dur_map[w])
+        if w.endswith("完找你") and w[:-3] in AFK_DUR_PRIOR:
+            return float(AFK_DUR_PRIOR[w[:-3]])
+        b = w[:-2] if w.endswith("找你") else w
+        for k in (b, b[:2], b[:3]):
+            if k in VAGUE_DUR_PRIOR:
+                return float(VAGUE_DUR_PRIOR[k])
+        return 90.0
+
+    def _promise_dur_min(self, word: str) -> float:
+        """预期等待时长（分钟）——抗规律感②锚取分布不取中位数：学习样本≥3 直接
+        从他本人真实历史里抽一张（方差是他自己的，不是人造噪声）；冷启动先验
+        ×0.75~1.35 抖动防可数规律。抗规律感③心情挪锚：高涨提前/蔫了推后（只动时机）"""
+        w = str(word)
+        ent = sorted(float(x) for x in ((self._st.get("afk_dur_learn") or {}).get(w) or []) if x > 0)
+        if len(ent) >= 3:
+            dur = random.choice(ent[-10:])
+        else:
+            dur = self._promise_prior_min(w) * random.uniform(0.75, 1.35)
+        mood = float(self._st.get("mood", 1.0))
+        if mood >= ANCHOR_MOOD_HI:
+            dur *= ANCHOR_MOOD_FAST
+        elif mood <= ANCHOR_MOOD_LO:
+            dur *= ANCHOR_MOOD_SLOW
+        return max(20.0, dur)
+
+    def _make_anchor_ts(self, word: str, base_ts: float) -> float:
+        """锚点三分类→绝对时刻：时刻词锚今晚 19:00~20:00 随机一分钟（说词时已是
+        晚上→30~60min 后头上）；活动/模糊词锚 base_ts+预期时长抽样"""
+        if self._promise_kind(word) == "time":
+            dt = datetime.fromtimestamp(base_ts)
+            target = (dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                      + timedelta(minutes=random.randint(*PROMISE_TIME_WIN))).timestamp()
+            if target < base_ts + 20 * 60:  # 已经是晚上了：锚到半小时后头上
+                target = base_ts + random.randint(30, 60) * 60
+            return target
+        return base_ts + self._promise_dur_min(word) * 60
+
+    def _anchor_of(self, p: dict) -> float:
+        """取约的有效锚；2.6.x 旧状态没有 anchor 字段 → 按词先验分布懒补"""
+        a = float(p.get("anchor") or 0)
+        if not a:
+            a = self._make_anchor_ts(str(p.get("word") or "晚点找你"),
+                                     float(p.get("event") or time.time()))
+            p["anchor"] = a
+        return a
 
     # ---------- v2.3.0 回归问候 ----------
 
@@ -2771,6 +2897,16 @@ class DafeiyuDmPlugin(Star):
             seen_chat = float((self._st.get("seen_chat") or {}).get(qq) or 0)
             if self.c_group_at_counts and seen_chat > ev:
                 ev = seen_chat
+            # v2.7.0 约过期清理：锚过 2h 还没等到人、她今天也没主动发过 → 销约+缺席留痕
+            # （抗规律感①：次日感官包自然带出"约了没等到"，她开口轻轻提一嘴——
+            #  他当晚回来会在 _stamp 里把留痕作废掉）
+            pl = s.get("promise") or {}
+            if pl.get("word") and now > self._anchor_of(pl) + PROMISE_EXPIRE_H * 3600:
+                fired_today = datetime.now().date().isoformat() in [f for f in (s.get("fires") or []) if f]
+                if not fired_today:
+                    self._st.setdefault("miss_trace", {})[umo] = {"word": pl["word"], "ts": now, "said": False}
+                    self._dlog({"t": "promise_trace", "umo": qq, "word": pl["word"]})
+                s["promise"] = None
             # ① 中签 pending 的到点处理
             pend = s.get("pending")
             if pend and now >= float(pend.get("at") or 0):
@@ -2804,6 +2940,12 @@ class DafeiyuDmPlugin(Star):
                 continue  # 跨夜长冷场交给晨起
             rounds = self._heat_rounds(umo, now)
             tier, base_thr = self._tier_for(umo, now, rounds)
+            # v2.7.0 锚前不掷：约在身且没到点 → 静默钟压零（hazard=0 本 tick 必不掷）——
+            # 她知道晚上有约，下午不瞎找；骰子从锚点起爬
+            if tier == "promise":
+                _pa = self._anchor_of(s.get("promise") or {})
+                if now < _pa:
+                    silence = 0.0
             d = s.get("dice")
             attempt = 1
             if d and float(d.get("event") or 0) == ev and d.get("rolled"):
@@ -2858,12 +3000,21 @@ class DafeiyuDmPlugin(Star):
                 p = p * f_retry
                 factors = dict(factors)
                 factors["retry"] = round(f_retry, 3)
+            # v2.7.0 重掷间隔：性格区间 × 热度(热0.45/中0.7/冷1) × 有约0.4 × 空闲日0.6，
+            # 下限 45min，右截今晚入睡-30min，不落频控禁发段；今晚放不下 → 本轮作废
+            # 不硬塞（次日晨间线接手）——详见 _next_retry_at
+            nxt = 0.0
+            if attempt < max_n:
+                nxt = self._next_retry_at(umo, now, tier, rounds, P)
+                if not nxt:
+                    self._dlog({"t": "retry_void", "umo": qq, "why": "今晚放不下",
+                                "tier": tier, "n": attempt})
             s["dice"] = {"event": ev, "rolled": True, "n": attempt, "max_n": max_n,
                          "t0": t0, "tau": round(tau_eff, 3),
                          "haz": round(p_haz, 4), "p": round(p, 3),
                          "factors": factors, "tier": tier,
-                         "next_at": (now + random.uniform(P.retry_gap_lo, P.retry_gap_hi) * 3600)
-                         if attempt < max_n else 0.0}
+                         "next_at": nxt,
+                         **({"done": True, "result": "no_room"} if not nxt and attempt < max_n else {})}
             if random.random() < p:
                 lo, hi = self.c_jitter_lo, self.c_jitter_hi
                 s["pending"] = {"event": ev, "at": now + random.uniform(lo, hi) * 60}
@@ -2884,6 +3035,11 @@ class DafeiyuDmPlugin(Star):
         # 又说过话（act_ts 比 pending 锚更新）才算翻篇；seen 推前的锚不算
         if float(s.get("act_ts") or -1) > float(s.get("pending", {}).get("event") or 0):
             return False, "事件翻篇(你回来过)"
+        # v2.7.0 群@联动（跟 dm_group_at_counts 走）：中签后他在群里@过她 = 见过面翻篇
+        if self.c_group_at_counts:
+            sc = float((self._st.get("seen_chat") or {}).get(str(umo.split(":")[-1])) or 0)
+            if sc > float(s.get("pending", {}).get("event") or 0):
+                return False, "事件翻篇(群里@过)"
         if phase != "awake":
             return False, "睡着了"
         if not self._in_quiet(now):
@@ -2897,6 +3053,60 @@ class DafeiyuDmPlugin(Star):
         if not self._quota_ok(now, umo):
             return False, "频控(间隔/总量)"
         return True, ""
+
+    def _promise_fire_note(self) -> str:
+        """v2.7.0 由头掷骰（抗规律感④）→ 约档生成附注：直赴约/借由头/带情绪 5:3:2。
+        约是隐藏动机，说出来的理由另抽——来的姿态每次都不一样"""
+        r = random.random()
+        if 0.5 <= r < 0.8:
+            return "（这条别直接提约定本身——像刚好看到个什么东西顺口发给他，由头是幌子，其实是等到点想他了）\n"
+        if r >= 0.8:
+            return "（等了这会儿还没等到人，这条带点小情绪：想念浓一点、或一点点小委屈、或困得没什么力气，挑一种，别真生气）\n"
+        return ""
+
+    def _next_retry_at(self, umo: str, now: float, tier: str, rounds: int, P) -> float:
+        """v2.7.0 重掷到点时刻（0=今晚作废不硬塞）：miss_retry_gap 性格区间 × 乘子
+        体系（热度×有约×空闲日），下限 45min，右截今晚评估窗尾（auto 窗=今晚入睡-30min），
+        最早也得等频控 min_gap 过去——中签到点被频控拦下作废的票，从排期就避开"""
+        m = (RETRY_MULT_HEAT[0] if rounds >= self.c_heat_hot_min
+             else RETRY_MULT_HEAT[2] if rounds <= self.c_heat_cold_max else RETRY_MULT_HEAT[1])
+        if tier == "promise":
+            m *= RETRY_MULT_PROMISE
+        if self._is_free_day():
+            m *= RETRY_MULT_FREE
+        lo = max(RETRY_FLOOR_MIN / 60.0, P.retry_gap_lo * m)
+        hi = max(lo, P.retry_gap_hi * m)
+        _, qhi = self._quiet_window()
+        nd = datetime.fromtimestamp(now)
+        remain_h = max(0.0, (qhi - (nd.hour * 60 + nd.minute)) / 60.0)
+        if lo >= remain_h:
+            return 0.0
+        at = now + random.uniform(lo, min(hi, remain_h)) * 3600
+        at = max(at, float(self._st.get("last_dm_ts") or 0) + self.c_gap * 3600 + 300)
+        if at - now > remain_h * 3600:
+            return 0.0
+        return at
+
+    def _grp_meet_clear(self, qq: str, pid: str):
+        """v2.7.0 群里@她=见面（跟 dm_group_at_counts 开关走，三行为绑一开关零新键）：
+        销约+销离席（见过面了不算"还没兑现"）+ 已中签 pending 作废（见过=翻篇）。
+        想念钟软重置由 _silence_eval 的 seen_chat 折叠完成，这里不重复"""
+        umo = f"{pid}:FriendMessage:{qq}"
+        fs = self._sess(umo)
+        cleared = []
+        if fs.get("promise"):
+            fs["promise"] = None
+            cleared.append("约")
+        if fs.get("afk"):
+            fs["afk"] = None
+            cleared.append("离席")
+        if fs.get("pending"):
+            fs["pending"] = None
+            self._dice_done(umo)
+            cleared.append("中签")
+        if cleared:
+            self._dlog({"t": "grp_meet", "umo": qq, "cleared": "/".join(cleared)})
+            self._save_state()
 
     async def _fire_miss(self, umo: str, now: float):
         """中签发送：否决（可选）→ 情景门控工具生成 → 拟人发送 → 记账"""
@@ -2930,6 +3140,9 @@ class DafeiyuDmPlugin(Star):
             extra_ctx += (f"（TA这会儿正在群里跟别人聊得欢，你们私聊已经 {_priv_gap:.0f} 小时没说话了——"
                           "你这条是私聊发的，像凑过去小声说一句，可以带点酸：群里聊那么欢都不来找我，"
                           "但别真吵架，傲娇的小委屈那种）\n")
+        # v2.7.0 由头掷骰（抗规律感④）：约档赴约不总走正门——直赴约/借由头/带情绪 5:3:2
+        if tier == "promise":
+            extra_ctx += self._promise_fire_note()
         if self.c_gen_mode.get("random") == "template":
             text = random.choice(self.c_pool)
             status = "ok"
@@ -2962,6 +3175,10 @@ class DafeiyuDmPlugin(Star):
             return
         archive_text = text + (f"\n[本轮工具：{'；'.join(self._tool_trace[:3])}]" if self._tool_trace else "")
         await self._archive_dm(umo, archive_text)
+        # v2.7.0 缺席留痕销账：她已经主动开过口了，这一页翻过去（晨间不再重复提）
+        tr = (self._st.get("miss_trace") or {}).get(umo)
+        if tr and not tr.get("said"):
+            tr["said"] = True
         self._st["random_sent"] = int(self._st.get("random_sent", 0)) + 1
         self._bookkeep(umo, now, "random")
         self._dlog({"t": "miss_sent", "umo": umo.split(":")[-1], "tag": tag, "text": text[:30]})
@@ -3786,6 +4003,44 @@ class DafeiyuDmPlugin(Star):
             f"台账：内心{led.get('inner', 0)} 生成{led.get('gen', 0)}"
             f" 工具{led.get('tools', 0)} 被否决{led.get('vetoed', 0)} 废稿{led.get('void_gen', 0)}"
         )
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("今晚骰子")
+    async def cmd_dice_tonight(self, event: AstrMessageEvent):
+        """v2.7.0 管理员自查：约的锚/掷骰进度/中签/留痕/心情一眼看全"""
+        if not self._is_admin(event):
+            yield event.plain_result("没权限")
+            return
+        self._rollover_day()
+        fmt = lambda t: datetime.fromtimestamp(t).strftime("%m-%d %H:%M") if t else "-"
+        lines = [f"[今晚骰子 v{PLUGIN_VERSION}] 今日 {self._st.get('date')}"
+                 f" 心情 {float(self._st.get('mood', 1.0)):.2f}"]
+        tmap = self._target_map()
+        for pid, qqs in tmap.items():
+            for qq in qqs:
+                umo = f"{pid}:FriendMessage:{qq}"
+                s = self._sess(umo)
+                pl = s.get("promise") or {}
+                if pl.get("word"):
+                    pa = self._anchor_of(pl)
+                    left = int((pa - time.time()) // 60)
+                    p_line = (f"约「{pl['word']}」({pl.get('kind')}) 锚{fmt(pa)}"
+                              + (f" 还剩{left}分" if left > 0 else f" 过了{-left}分"))
+                else:
+                    p_line = "约无"
+                d = s.get("dice") or {}
+                if d.get("rolled"):
+                    d_line = (f"骰{d.get('n')}/{d.get('max_n')} p={d.get('p', 0):.2f} 档[{d.get('tier')}]"
+                              + (f" 下掷{fmt(d.get('next_at'))}" if float(d.get("next_at") or 0) > 0 else "")
+                              + (f" 终({d.get('result') or '了'})" if d.get("done") else ""))
+                else:
+                    d_line = "骰未掷"
+                pd = s.get("pending") or {}
+                pd_line = f" 中签→{fmt(pd.get('at'))}" if pd.get("at") else ""
+                tr = (self._st.get("miss_trace") or {}).get(umo) or {}
+                tr_line = (f" 留痕「{tr.get('word')}」{'已提' if tr.get('said') else '待提'}"
+                           if tr.get("word") else "")
+                lines.append(f"· {qq}：{p_line}｜{d_line}{pd_line}{tr_line}")
         yield event.plain_result("\n".join(lines))
 
     def _miss_day_stats(self, qq: str) -> dict:
