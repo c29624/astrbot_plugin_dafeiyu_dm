@@ -37,7 +37,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.7.3"
+PLUGIN_VERSION = "2.7.4"
 DM_PERSONA_SLICE = 999999  # v2.2.0 切片2600→v2.5.12 放开全量（用户拍板）：主动消息看完整人设，底线下沉段/语气参考不再窗外；主动消息日均≤7条，全量约+1.3K token/条，忽略不计
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -2272,8 +2272,19 @@ class DafeiyuDmPlugin(Star):
             anchor = ""
             afk = s.get("afk") or {}
             if isinstance(afk, dict) and afk.get("word"):
-                anchor = "，TA {} 说「{}」离开".format(
-                    datetime.fromtimestamp(float(afk.get("event") or act)).strftime("%H:%M"), afk["word"])
+                # v2.7.4 离席锚三段保质期（治"前天的吃饭喂到今天"）：新鲜期（预期时长内）
+                # 照旧"去吃饭还没回"；过点期（到预期×2.5，封顶8h）改喂"说了去吃饭都X小时
+                # 没冒头"——调侃燃料（一顿饭吃三小时？），不当真还在吃；超时彻底不提
+                _a_ev = float(afk.get("event") or act)
+                _a_dur = self._afk_dur_learn_min(afk["word"])
+                _a_age = (now - _a_ev) / 60.0
+                if _a_age <= _a_dur:
+                    anchor = "，TA {} 说「{}」离开还没回".format(
+                        datetime.fromtimestamp(_a_ev).strftime("%H:%M"), afk["word"])
+                elif _a_age <= min(_a_dur * 2.5, 480):
+                    anchor = ("，TA {} 说「{}」离开，到现在 {} 小时没冒头——早该完事了，"
+                              "可以纳闷或调侃一句（一顿饭吃三小时？那种味），别当出了什么事").format(
+                        datetime.fromtimestamp(_a_ev).strftime("%H:%M"), afk["word"], round(_a_age / 60))
             promise = s.get("promise") or {}
             if isinstance(promise, dict) and promise.get("word"):
                 pa = self._anchor_of(promise)
@@ -3019,6 +3030,14 @@ class DafeiyuDmPlugin(Star):
                     self._st.setdefault("miss_trace", {})[umo] = {"word": pl["word"], "ts": now, "said": False}
                     self._dlog({"t": "promise_trace", "umo": qq, "word": pl["word"]})
                 s["promise"] = None
+            # v2.7.4 过期离席锚退役：超过该词预期×2.5（封顶8h）还没翻篇 → 从状态里删掉
+            #（感官包注入侧同口径三段，见 _status_ctx——治"前天的吃饭喂到今天"）
+            _a_gc = s.get("afk") or {}
+            if _a_gc.get("word"):
+                _a_d = self._afk_dur_learn_min(_a_gc["word"])
+                if (now - float(_a_gc.get("event") or 0)) > min(_a_d * 2.5, 480) * 60:
+                    s["afk"] = None
+                    self._dlog({"t": "afk_expire", "umo": qq, "word": _a_gc["word"]})
             # ① 中签 pending 的到点处理
             pend = s.get("pending")
             if pend and now >= float(pend.get("at") or 0):
