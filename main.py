@@ -37,7 +37,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.7.4"
+PLUGIN_VERSION = "2.7.5"
 DM_PERSONA_SLICE = 999999  # v2.2.0 切片2600→v2.5.12 放开全量（用户拍板）：主动消息看完整人设，底线下沉段/语气参考不再窗外；主动消息日均≤7条，全量约+1.3K token/条，忽略不计
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -224,6 +224,14 @@ DEFAULTS = {
     "miss_free_dates": [],            # 手动节假日表 "10-01" 或 "2026-10-01"
     "miss_busy_dates": [],            # 调休补班表（优先级最高）
     "miss_afk_words": ["吃饭", "干饭", "洗澡", "洗漱", "出门", "取快递", "上课", "上班", "下班", "加班", "打游戏"],
+    # v2.7.5 释放词：与离席词同条出现（"吃饭去咯不用等我啦"）=他明说不用等——
+    # 短串子串匹配，"不用等我啦/哈/哦"等尾缀不用单独列
+    "miss_afk_release_words": [
+        "不用等", "别等我", "别等了", "不等我", "不用候着", "不用掐点",
+        "你先忙", "你忙你的", "你先玩", "你玩你的", "你先休息",
+        "别管我", "不用管我", "别惦记", "不用惦记", "不用回我",
+        "要很久", "会很久", "得很久", "很晚才", "得一阵子", "一时半会",
+    ],
     "miss_promise_words": ["晚点找你", "等会找你", "等会儿找你", "待会找你", "待会聊", "晚上找你", "晚上聊", "回头找你", "回来找你"],
     "miss_night_words": ["晚安", "睡了", "先睡", "去睡", "睡觉啦", "睡觉了", "睡啦"],  # 你先道别→她躺下必收尾（不因她睡晚漏掉）
     "miss_night_words_from": "20:00",  # 道别词从几点开始算数（再配合同晚8h闸双保险）
@@ -628,6 +636,7 @@ class DafeiyuDmPlugin(Star):
         self.c_free_dates = self._parse_datelist(g("miss_free_dates"))
         self.c_busy_dates = self._parse_datelist(g("miss_busy_dates"))
         self.c_afk_words = [str(w).strip() for w in (g("miss_afk_words") or []) if str(w).strip()]
+        self.c_release_words = [str(w).strip() for w in (g("miss_afk_release_words") or []) if str(w).strip()]
         self.c_promise_words = [str(w).strip() for w in (g("miss_promise_words") or []) if str(w).strip()]
         self.c_night_words = [str(w).strip() for w in (g("miss_night_words") or []) if str(w).strip()]
         self.c_night_from = _parse_hhmm(g("miss_night_words_from"))
@@ -1417,13 +1426,27 @@ class DafeiyuDmPlugin(Star):
                     if (f"你{hit}" in text) or residue:
                         hit = None
                 if hit:
+                    # v2.7.5 释放词：同条带"不用等"类 → 释放锚（不开回归窗/档位回落/感官包换文案）
+                    _rel = self._release_hit(text)
                     s["afk"] = {"word": hit, "event": now}
+                    if _rel:
+                        s["afk"]["released"] = True
+                        self._dlog({"t": "afk_release", "word": hit, "rel": _rel})
+                    # 窗 dict 照建（带 released 永不开窗）：他回来时 afk_dur_learn 样本照记
                     s["afk_check"] = {"word": hit, "event": now, "text": text[:80],
                                       "rounds": self._heat_rounds(umo, now)}
+                    if _rel:
+                        s["afk_check"]["released"] = True
+                        # 释放优先于承诺（跨消息版）：先头挂的约，此刻明说不用等 → 约也放掉，
+                        # 不留"到最后也没好好来找我"的留痕——人家发话了
+                        if s.get("promise"):
+                            s["promise"] = None
+                            self._dlog({"t": "promise_release_void", "word": hit})
                     # v2.5.10 离席伴随承诺：同条消息带"找你"（无否定）=约了回来（"吃完找你哟"）——
                     # 事件式前缀不在约定词表（表认时间前缀），漏网会丢回归问候加成档/履约记账/
                     # 被晾委屈的"你明明说找我的"档
-                    if ("找你" in text and not s.get("promise")
+                    # v2.7.5 释放优先于承诺（同条版）：都说了不用等，约不挂（矛盾按不用等处理）
+                    if (not _rel and "找你" in text and not s.get("promise")
                             and not any(n in text for n in ("不找你", "别找你", "没找你"))):
                         pw = hit + "完找你"
                         s["promise"] = {"word": pw, "event": now, "kind": "dur",
@@ -1431,7 +1454,8 @@ class DafeiyuDmPlugin(Star):
                                         "word_ts": now, "bubble_n": 0}
             if self.c_promise_words:
                 hit = next((w for w in self.c_promise_words if w in text), None)
-                if hit:
+                # v2.7.5 释放词在场同条不挂约（"晚点找你，你先玩不用等"→只当他走了不用等）
+                if hit and not self._release_hit(text):
                     s["promise"] = {"word": hit, "event": now,
                                     "kind": self._promise_kind(hit),
                                     "anchor": self._make_anchor_ts(hit, now),
@@ -1623,8 +1647,8 @@ class DafeiyuDmPlugin(Star):
         # 压到 0），锚后到销约前这窗是"该回来了还没回"的念想高峰
         if promise and now < self._anchor_of(promise) + PROMISE_EXPIRE_H * 3600:
             tier = "promise"   # 约定未赴 → 中档
-        elif afk and 0 <= ev - float(afk.get("event") or -1) <= grace:
-            tier = "afk"       # 离席词 → 吃饭档
+        elif afk and not afk.get("released") and 0 <= ev - float(afk.get("event") or -1) <= grace:
+            tier = "afk"       # 离席词 → 吃饭档（v2.7.5 释放锚回落 normal：他说了不用等）
         elif rounds >= self.c_heat_hot_min and s.get("act_from") == "user":
             tier = "hot"       # 聊嗨断线无交代 → 中档
         else:
@@ -2275,16 +2299,29 @@ class DafeiyuDmPlugin(Star):
                 # v2.7.4 离席锚三段保质期（治"前天的吃饭喂到今天"）：新鲜期（预期时长内）
                 # 照旧"去吃饭还没回"；过点期（到预期×2.5，封顶8h）改喂"说了去吃饭都X小时
                 # 没冒头"——调侃燃料（一顿饭吃三小时？），不当真还在吃；超时彻底不提
+                # v2.7.5a 回来即闭嘴：锚说"还没回"，可他锚后出过声（act 超过词后宽限）——
+                # 叙事已死，不再注入（治"人回来聊过了她还念3小时没冒头"的穿帮）
                 _a_ev = float(afk.get("event") or act)
-                _a_dur = self._afk_dur_learn_min(afk["word"])
-                _a_age = (now - _a_ev) / 60.0
-                if _a_age <= _a_dur:
-                    anchor = "，TA {} 说「{}」离开还没回".format(
-                        datetime.fromtimestamp(_a_ev).strftime("%H:%M"), afk["word"])
-                elif _a_age <= min(_a_dur * 2.5, 480):
-                    anchor = ("，TA {} 说「{}」离开，到现在 {} 小时没冒头——早该完事了，"
-                              "可以纳闷或调侃一句（一顿饭吃三小时？那种味），别当出了什么事").format(
-                        datetime.fromtimestamp(_a_ev).strftime("%H:%M"), afk["word"], round(_a_age / 60))
+                if act <= _a_ev + AFK_GRACE_MIN * 60:
+                    _a_dur = self._afk_dur_learn_min(afk["word"])
+                    _a_age = (now - _a_ev) / 60.0
+                    if afk.get("released"):
+                        # v2.7.5 释放锚：他交代了不用等——她不掐表，惦记轻着来
+                        if _a_age <= _a_dur:
+                            anchor = ("，TA {} 说「{}」还交代了不用等——他自己说要一阵子，"
+                                      "你别掐着表，想说话就随便念叨一句（知道他在忙），不用等他回").format(
+                                datetime.fromtimestamp(_a_ev).strftime("%H:%M"), afk["word"])
+                        elif _a_age <= min(_a_dur * 2.5, 480):
+                            anchor = ("，TA {} 说「{}」（交代过不用等），到现在 {} 小时没冒头——"
+                                      "按说早完事了，人家都发话不用等，惦记的话轻轻带一句就行").format(
+                                datetime.fromtimestamp(_a_ev).strftime("%H:%M"), afk["word"], round(_a_age / 60))
+                    elif _a_age <= _a_dur:
+                        anchor = "，TA {} 说「{}」离开还没回".format(
+                            datetime.fromtimestamp(_a_ev).strftime("%H:%M"), afk["word"])
+                    elif _a_age <= min(_a_dur * 2.5, 480):
+                        anchor = ("，TA {} 说「{}」离开，到现在 {} 小时没冒头——早该完事了，"
+                                  "可以纳闷或调侃一句（一顿饭吃三小时？那种味），别当出了什么事").format(
+                            datetime.fromtimestamp(_a_ev).strftime("%H:%M"), afk["word"], round(_a_age / 60))
             promise = s.get("promise") or {}
             if isinstance(promise, dict) and promise.get("word"):
                 pa = self._anchor_of(promise)
@@ -2530,6 +2567,11 @@ class DafeiyuDmPlugin(Star):
 
     # ---------- v2.3.0 回归问候 ----------
 
+    def _release_hit(self, text: str):
+        """v2.7.5 释放词命中（"不用等"类）：只在已锚到离席词的同条消息里被调用；
+        短串子串匹配，天然盖住"不用等我啦/哈"等尾缀"""
+        return next((w for w in self.c_release_words if w in text), None)
+
     def _afk_dur_learn_min(self, word: str) -> float:
         """该词的预期时长（分钟）：学习表 n≥3 用中位数（偶数取中间均值），否则先验；配置覆盖最优先"""
         if word in self.c_afk_dur_map:
@@ -2546,7 +2588,8 @@ class DafeiyuDmPlugin(Star):
         返回 (锚dict, intent, 窗开始时刻) 或 None"""
         s = self._sess(umo)
         a = s.get("afk_check") or {}
-        if not a.get("word") or a.get("done"):
+        # v2.7.5 释放锚永不开窗：dict 留着只当学习载体（他回来记 afk_dur_learn 样本）
+        if not a.get("word") or a.get("done") or a.get("released"):
             return None
         ev = float(a.get("event") or 0)
         if not ev or float(s.get("act_ts") or 0) > ev:
@@ -4187,10 +4230,13 @@ class DafeiyuDmPlugin(Star):
                 pd = s.get("pending") or {}
                 pd_line = (f" 中签{'顺延' if pd.get('deferred') else ''}→{fmt(pd.get('at'))}"
                            if pd.get("at") else "")
+                _af = s.get("afk") or {}
+                af_line = (f" 离席「{_af['word']}」{'已释放' if _af.get('released') else ''}"
+                           if _af.get("word") else "")
                 tr = (self._st.get("miss_trace") or {}).get(umo) or {}
                 tr_line = (f" 留痕「{tr.get('word')}」{'已提' if tr.get('said') else '待提'}"
                            if tr.get("word") else "")
-                lines.append(f"· {qq}：{p_line}｜{d_line}{pd_line}{tr_line}")
+                lines.append(f"· {qq}：{p_line}｜{d_line}{pd_line}{af_line}{tr_line}")
         if want and not matched:
             _all = "/".join("/".join(qqs) for qqs in tmap.values()) or "无"
             lines.append(f"查无目标 {'/'.join(sorted(want))}（现有目标：{_all}）")
