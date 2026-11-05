@@ -37,7 +37,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.7.2"
+PLUGIN_VERSION = "2.7.3"
 DM_PERSONA_SLICE = 999999  # v2.2.0 切片2600→v2.5.12 放开全量（用户拍板）：主动消息看完整人设，底线下沉段/语气参考不再窗外；主动消息日均≤7条，全量约+1.3K token/条，忽略不计
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -83,6 +83,14 @@ RETRY_MULT_FREE = 0.6                # 空闲日：闲着更容易想起来
 RETRY_FLOOR_MIN = 45                 # 重掷间隔下限（分钟）
 ANCHOR_MOOD_HI, ANCHOR_MOOD_LO = 1.05, 0.90   # 心情挪锚阈值（只动时机不动概率）
 ANCHOR_MOOD_FAST, ANCHOR_MOOD_SLOW = 0.7, 1.5  # 高涨→锚提前30% / 蔫→推后50%
+# v2.7.3 赴约时机细化（设计稿第七轮定稿，常量不进面板——零新键纪律）
+FAKE_PROMISE_MIN = 8.0      # 假约线：说词后初始链拖超这分钟数=约作废（哪有说完又聊七八分钟的）
+EARLY_RATIO = 0.6           # 3/5 线：等了不到预期60%就赴约=过早，样本不入池
+EARLY_STREAK_N = 4          # 连续第4次过早才开始入池（节奏真变了），正常时长即清零
+DEFER_LO, DEFER_HI = 40, 80  # 中签撞回归：票顺延区间（分钟），只顺延一次
+ANCHOR_CAP_MARGIN = 15      # 夜约钳窗尾：锚不越今晚评估窗尾-15min（穿窗否决）
+GENERIC_RETURN_WORDS = ("回来啦", "我回来了", "回来了呀", "来找你了", "来找你啦",
+                        "找你啦", "找你来了")  # 通用回归词：不管约的是什么都算赴约
 # 普通/告别池随 T 弹性：c_plain=0.55+0.3T / c_bye=min(0.35+0.5T,0.7)，池=c±0.1，告别顶钳 0.8
 REUNION_E_LO, REUNION_E_HI = 6 * 3600, 36 * 3600   # 重逢 E_eff 钳位（秒）
 REUNION_TIERS = ((2, 48 * 3600, 72 * 3600),        # (倍数, 绝对下限, 绝对上限) 轻哼 2~3 天
@@ -1286,52 +1294,66 @@ class DafeiyuDmPlugin(Star):
                     s["t_warm_before"] = tw
                 s["_reunion_due"] = True
                 s["_reunion_gap"] = now - float(prev_msgs[-1])
-            # v2.7.2 赴约三档（用户 2026-11-05 拍板"就算没有两小时也不能不算赴约"）：
-            # ①锚到/过了回来=赴约；②锚前聊起来（超5分钟或≥3条）=提前赴约——人到了就是
-            #   到了，等待样本=出发→他回来第一条；③锚前冒泡（≤5分钟且≤2条，游戏回城
-            #   顺口回一句）=约保留、活动词锚顺延。冒泡轮间隔超宽限=两回事，重开一轮
+            # v2.7.3 赴约状态机（设计稿第七轮定稿，替代 2.7.2 的三档版）：
+            # ①完成词（通用回归词任意时候/活动完成词严格匹配活动根）→当场赴约；
+            # ②假约：dur 类说词后初始链拖超 8 分钟→作废清零无痕（时刻词不适用——
+            #   "晚上找你"是宣告今晚的计划，接着聊天不作废）；
+            # ③到点/迟到（≥锚-宽限）→赴约；④拜访聊起来（≥3条或跨度>5min）→提前赴约；
+            # ⑤锚前冒泡（≤2条的拜访回合，散了没成气候）→约保留、锚冻结（游戏没重开），
+            #   冒泡回合计数 bubble_n；⑥第二次冒泡=算回来（没理由一直冒泡耍人）；
+            # ⑦还没离开过（说完词连续聊，gap≤5min 且从未有过拜访）→不判赴约，
+            #   锚跟最后一条消息走（等效从真离开那刻起算）
             pl = s.get("promise") or {}
             if pl.get("word"):
                 _grace = AFK_GRACE_MIN * 60
-                back_at = float(pl.get("back_at") or 0)
-                if back_at and now - prev_act > _grace:
-                    pl.pop("back_at", None)   # 上一轮冒泡早结束了：清账重开一轮
-                    pl.pop("back_from", None)
-                    pl.pop("back_n", None)
-                    back_at = 0
-                if now >= self._anchor_of(pl) - _grace:
-                    substantive = True
-                elif not back_at:
-                    pl["back_at"], pl["back_from"], pl["back_n"] = now, prev_act, 1
-                    substantive = False
-                elif now - back_at > _grace or int(pl.get("back_n") or 1) >= 2:
-                    substantive = True  # 锚前就聊起来了 = 提前赴约
-                else:
-                    pl["back_n"] = int(pl.get("back_n") or 1) + 1
-                    substantive = False
-                if substantive:
-                    first_back = float(pl.get("back_at") or now)
-                    dep = float(pl.get("back_from") or prev_act)
-                    gap = first_back - dep
-                    log = (s.setdefault("promise_log", []) or [])[-10:]
-                    log.append({"word": pl["word"], "at": now, "kept": True})
-                    s["promise_log"] = log[-10:]
-                    prior = self._promise_prior_min(pl["word"])
-                    if 5 * 60 < gap < prior * 2.5 * 60:
-                        self._st.setdefault("afk_dur_learn", {}).setdefault(pl["word"], []).append(round(gap / 60, 1))
-                        lst = self._st["afk_dur_learn"][pl["word"]]
-                        if len(lst) > 10:
-                            self._st["afk_dur_learn"][pl["word"]] = lst[-10:]
-                    s["promise"] = None
-                    self._dlog({"t": "promise_kept", "umo": umo.split(":")[-1],
-                                "word": pl["word"], "gap_min": round(gap / 60, 1),
-                                "early": back_at > 0})
-                else:
-                    pl["event"] = now
-                    if pl.get("kind") != "time":
-                        pl["anchor"] = self._make_anchor_ts(pl["word"], now)
-                        pl["kind"] = "dur"
-                    self._dlog({"t": "promise_touch", "umo": umo.split(":")[-1], "word": pl["word"]})
+                gap = now - prev_act
+                anchor = self._anchor_of(pl)
+                word_ts = float(pl.get("word_ts") or pl.get("event") or prev_act)
+                if self._hit_completion(pl["word"], text):
+                    self._kept_fulfill(umo, s, pl, now, prev_act, now, via="done")
+                elif now >= anchor - _grace:
+                    back_ts = float(pl.get("visit_at") or now)
+                    dep = float(pl.get("visit_from") or prev_act)
+                    self._kept_fulfill(umo, s, pl, back_ts, dep, now, via="ontime")
+                elif gap <= _grace:
+                    if (not pl.get("visit_ever") and pl.get("kind") != "time"
+                            and now - word_ts > FAKE_PROMISE_MIN * 60):
+                        s["promise"] = None  # 假约：说完又聊七八分钟的，作废清零无痕
+                        self._dlog({"t": "promise_fake", "umo": umo.split(":")[-1], "word": pl["word"]})
+                    elif pl.get("visit_at"):  # 拜访中的连续消息：数到聊起来为止
+                        pl["visit_n"] = int(pl.get("visit_n") or 1) + 1
+                        if int(pl.get("visit_n") or 1) >= 3 or now - float(pl["visit_at"]) > _grace:
+                            self._kept_fulfill(umo, s, pl, float(pl["visit_at"]),
+                                               float(pl.get("visit_from") or prev_act),
+                                               now, via="visit")
+                    elif not pl.get("visit_ever"):
+                        # 说完约还在聊：没离开过，不判赴约——锚跟最后一条消息走
+                        pl["event"] = now
+                        if pl.get("kind") != "time":
+                            pl["anchor"] = self._make_anchor_ts(pl["word"], now)
+                else:  # 离开过、锚前回来
+                    if pl.get("visit_at"):  # 上一回合拜访散了没成气候=一次冒泡
+                        pl["bubble_n"] = int(pl.get("bubble_n") or 0) + 1
+                        pl.pop("visit_at", None)
+                        pl.pop("visit_from", None)
+                        pl.pop("visit_n", None)
+                    if int(pl.get("bubble_n") or 0) >= 1:
+                        # 第二次冒泡=算回来
+                        self._kept_fulfill(umo, s, pl, now, prev_act, now, via="bubble2")
+                    else:
+                        pl["visit_at"], pl["visit_from"], pl["visit_n"] = now, prev_act, 1
+                        pl["visit_ever"] = True
+                        self._dlog({"t": "promise_touch", "umo": umo.split(":")[-1], "word": pl["word"]})
+            # v2.7.3 中签撞回归：票不销，顺延 40~80min（只一次）——先顺延、到点自动裁决：
+            # 他真聊起来/真回来（赴约清票或 act_ts 越过新锚）→翻篇判定自然作废；
+            # 冒泡走人就到点照发（把"人冒头了"这件事消化掉再想他）
+            pd = s.get("pending")
+            if pd and pd.get("at") and not pd.get("deferred"):
+                pd["deferred"] = True
+                pd["event"] = now
+                pd["at"] = now + random.uniform(DEFER_LO, DEFER_HI) * 60
+                self._dlog({"t": "pending_defer", "umo": umo.split(":")[-1],
+                            "at": datetime.fromtimestamp(pd["at"]).strftime("%H:%M")})
             # v2.7.0 缺席留痕兜底：销约后当晚他还是来了 → 次日"没等到"的提一嘴作废
             tr = (self._st.get("miss_trace") or {}).get(umo)
             if tr and not tr.get("said") and now - float(tr.get("ts") or 0) < 24 * 3600:
@@ -1405,13 +1427,15 @@ class DafeiyuDmPlugin(Star):
                             and not any(n in text for n in ("不找你", "别找你", "没找你"))):
                         pw = hit + "完找你"
                         s["promise"] = {"word": pw, "event": now, "kind": "dur",
-                                        "anchor": self._make_anchor_ts(pw, now)}
+                                        "anchor": self._make_anchor_ts(pw, now),
+                                        "word_ts": now, "bubble_n": 0}
             if self.c_promise_words:
                 hit = next((w for w in self.c_promise_words if w in text), None)
                 if hit:
                     s["promise"] = {"word": hit, "event": now,
                                     "kind": self._promise_kind(hit),
-                                    "anchor": self._make_anchor_ts(hit, now)}
+                                    "anchor": self._make_anchor_ts(hit, now),
+                                    "word_ts": now, "bubble_n": 0}
             # 你先道了别：记下时刻（起点时刻后算数，防白天误伤）——她睡得再晚，躺下也必收尾
             if self.c_night_words:
                 dt = datetime.fromtimestamp(now)
@@ -2292,7 +2316,7 @@ class DafeiyuDmPlugin(Star):
         if tr and not tr.get("said") and now - float(tr.get("ts") or 0) > 6 * 3600:
             _td = (now - float(tr.get("ts") or 0)) / 3600
             _when = "刚才" if _td < 14 else ("昨天" if _td < 36 else "前两天")
-            parts.append(f"{_when}TA说「{tr.get('word')}」结果一直没来，你也没等到——"
+            parts.append(f"{_when}TA说「{tr.get('word')}」到最后也没好好来找我，你也没等到——"
                          "现在开口可以自然带一嘴这事，轻轻的，不兴师问罪")
         parts.append(f"今日已主动 {int(self._st.get('sent_total', 0))} 条；现在 {datetime.now().strftime('%H:%M')}")
         return "[背景事实：" + "；".join(parts) + "]\n"
@@ -2416,8 +2440,8 @@ class DafeiyuDmPlugin(Star):
                       + timedelta(minutes=random.randint(*PROMISE_TIME_WIN))).timestamp()
             if target < base_ts + 20 * 60:  # 已经是晚上了：锚到半小时后头上
                 target = base_ts + random.randint(30, 60) * 60
-            return target
-        return base_ts + self._promise_dur_min(word) * 60
+            return self._anchor_cap(target, base_ts)
+        return self._anchor_cap(base_ts + self._promise_dur_min(word) * 60, base_ts)
 
     def _anchor_of(self, p: dict) -> float:
         """取约的有效锚；2.6.x 旧状态没有 anchor 字段 → 按词先验分布懒补"""
@@ -2427,6 +2451,71 @@ class DafeiyuDmPlugin(Star):
                                      float(p.get("event") or time.time()))
             p["anchor"] = a
         return a
+
+    def _anchor_cap(self, anchor: float, base_ts: float) -> float:
+        """v2.7.3 夜约钳窗尾（穿窗否决）：锚不越今晚评估窗尾-15min——她当晚临睡前还
+        来得及想一把，而不是只能等次晨留痕抱怨。下限=说词+20min，再晚挂的约不强求"""
+        try:
+            _, qhi = self._quiet_window()
+            bd = datetime.fromtimestamp(base_ts)   # 窗尾按"说词当天"算——锚跨午夜不能用锚自己的日期
+            cap = bd.replace(hour=int(qhi) // 60, minute=int(qhi) % 60,
+                             second=0, microsecond=0).timestamp() - ANCHOR_CAP_MARGIN * 60
+        except Exception:
+            return anchor
+        if anchor <= cap:
+            return anchor
+        return max(cap, base_ts + 20 * 60)
+
+    def _hit_completion(self, word: str, text: str) -> bool:
+        """v2.7.3 完成词=当场赴约：通用回归词任意命中；活动完成词严格匹配约词的
+        活动根（"打完游戏了"销游戏约、"吃完饭啦"销不动游戏约）——根首字+"完"与
+        根其余部分同现才算，否定（"还没打完"）不算"""
+        t = str(text)
+        if any(w in t for w in GENERIC_RETURN_WORDS):
+            return True
+        root = str(word)[:-3] if str(word).endswith("完找你") else ""
+        if len(root) >= 2:
+            if f"{root[0]}完" in t and root[1:] in t and f"没{root[0]}完" not in t:
+                return True
+        return False
+
+    def _kept_fulfill(self, umo: str, s: dict, pl: dict, back_ts: float, dep: float,
+                      now: float, via: str):
+        """v2.7.3 赴约统一收口：记履约（kept 恒记——人到了就是到了）+ 样本三闸
+        （真离开>5min / 卫生<先验×2.5 / 过早<预期3/5不入池，连续第4次起入池，
+        正常时长即清零计数）+ 销约销票。样本=出发→他回来第一条（从最后一条消息起算）"""
+        w = str(pl.get("word") or "")
+        anchor = self._anchor_of(pl)
+        real_gap = back_ts - dep
+        expected = max(20.0, (anchor - dep) / 60.0)
+        elapsed = real_gap / 60.0
+        grace = AFK_GRACE_MIN * 60
+        early = real_gap > grace and elapsed < expected * EARLY_RATIO
+        log = (s.setdefault("promise_log", []) or [])[-10:]
+        log.append({"word": w, "at": now, "kept": True})
+        s["promise_log"] = log[-10:]
+        pooled = False
+        if grace < real_gap < self._promise_prior_min(w) * 2.5 * 60:
+            streaks = self._st.setdefault("early_streak", {})
+            if not early:
+                streaks[w] = 0
+                self._st.setdefault("afk_dur_learn", {}).setdefault(w, []).append(round(elapsed, 1))
+                pooled = True
+            else:
+                streaks[w] = int(streaks.get(w, 0)) + 1
+                if streaks[w] >= EARLY_STREAK_N:
+                    self._st.setdefault("afk_dur_learn", {}).setdefault(w, []).append(round(elapsed, 1))
+                    pooled = True
+            lst = self._st.get("afk_dur_learn", {}).get(w) or []
+            if 0 < len(lst) > 10:
+                self._st["afk_dur_learn"][w] = lst[-10:]
+        s["promise"] = None
+        if s.get("pending"):   # 人都到了，中签的票不用留着
+            s["pending"] = None
+            self._dice_done(umo)
+        self._dlog({"t": "promise_kept", "umo": umo.split(":")[-1], "word": w,
+                    "gap_min": round(elapsed, 1), "early_ratio": round(elapsed / expected, 2),
+                    "via": via, "pooled": pooled})
 
     # ---------- v2.3.0 回归问候 ----------
 
@@ -4065,7 +4154,8 @@ class DafeiyuDmPlugin(Star):
                     pa = self._anchor_of(pl)
                     left = int((pa - time.time()) // 60)
                     p_line = (f"约「{pl['word']}」({pl.get('kind')}) 锚{fmt(pa)}"
-                              + (f" 还剩{left}分" if left > 0 else f" 过了{-left}分"))
+                              + (f" 还剩{left}分" if left > 0 else f" 过了{-left}分")
+                              + (f" 冒泡×{pl.get('bubble_n') or 0}" if pl.get("bubble_n") else ""))
                 else:
                     p_line = "约无"
                 d = s.get("dice") or {}
@@ -4076,7 +4166,8 @@ class DafeiyuDmPlugin(Star):
                 else:
                     d_line = "骰未掷"
                 pd = s.get("pending") or {}
-                pd_line = f" 中签→{fmt(pd.get('at'))}" if pd.get("at") else ""
+                pd_line = (f" 中签{'顺延' if pd.get('deferred') else ''}→{fmt(pd.get('at'))}"
+                           if pd.get("at") else "")
                 tr = (self._st.get("miss_trace") or {}).get(umo) or {}
                 tr_line = (f" 留痕「{tr.get('word')}」{'已提' if tr.get('said') else '待提'}"
                            if tr.get("word") else "")
