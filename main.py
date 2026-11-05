@@ -37,7 +37,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.6.3"
+PLUGIN_VERSION = "2.6.4"
 DM_PERSONA_SLICE = 999999  # v2.2.0 切片2600→v2.5.12 放开全量（用户拍板）：主动消息看完整人设，底线下沉段/语气参考不再窗外；主动消息日均≤7条，全量约+1.3K token/条，忽略不计
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -2834,6 +2834,10 @@ class DafeiyuDmPlugin(Star):
                     max_n = 1
                 else:
                     max_n = random.randint(1, 2)
+                # v2.6.4 有约档加一掷（用户 2026-11-05 拍板）：他留了"晚点找你"的约，单掷封盘
+                # 会让82%的高概率一次输光后数小时无票（实测 10:30 输后 4h 干等）——有约在身多想一次
+                if tier == "promise":
+                    max_n += 1
                 # 想念半衰期随热度伸缩（v1.6.1，池内随机抽防可数）：聊得越热念想褪得越慢
                 if rounds >= self.c_heat_hot_min:
                     hm = random.uniform(1.3, 1.6)
