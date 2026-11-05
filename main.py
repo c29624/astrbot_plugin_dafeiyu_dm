@@ -37,7 +37,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.7.0"
+PLUGIN_VERSION = "2.7.1"
 DM_PERSONA_SLICE = 999999  # v2.2.0 切片2600→v2.5.12 放开全量（用户拍板）：主动消息看完整人设，底线下沉段/语气参考不再窗外；主动消息日均≤7条，全量约+1.3K token/条，忽略不计
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -1262,6 +1262,10 @@ class DafeiyuDmPlugin(Star):
             text = str(getattr(event, "message_str", "") or "")
             if sender and sender == self_id:
                 self._stamp(umo, now, "bot", "")   # 自己的普通回复也算"会话有动静"
+                return
+            # v2.7.1 指令不污染会话：/ 开头的管理指令不算"他来说话"——不推静默钟、
+            # 不触发履约/离席检测（查 /今晚骰子 不该把她"该来了"的钟清掉）
+            if self._is_cmd_text(text):
                 return
             self._stamp(umo, now, "user", text)
         except Exception:
@@ -4005,19 +4009,36 @@ class DafeiyuDmPlugin(Star):
         )
         yield event.plain_result("\n".join(lines))
 
+    @staticmethod
+    def _is_cmd_text(text: str) -> bool:
+        """/ 开头=管理指令（不算聊天内容；唤醒前缀默认就是 /）"""
+        return str(text).lstrip().startswith("/")
+
+    @staticmethod
+    def _qq_args(raw: str) -> set:
+        """从指令原文里抠纯数字 token 当 QQ 号（"今晚骰子"本身不含数字，不会误中）"""
+        return {t for t in str(raw).replace("@", " ").split() if t.isdigit() and len(t) >= 5}
+
     @filter.command("今晚骰子")
     async def cmd_dice_tonight(self, event: AstrMessageEvent):
-        """v2.7.0 管理员自查：约的锚/掷骰进度/中签/留痕/心情一眼看全"""
+        """v2.7.0 管理员自查：约的锚/掷骰进度/中签/留痕/心情一眼看全。
+        v2.7.1 可带 QQ 号过滤（/今晚骰子 123456789）；任何你挂管理员的对话都能发
+        （群里/临时会话都行，输出只回当前对话）——不用在跟她的私聊里发"""
         if not self._is_admin(event):
             yield event.plain_result("没权限")
             return
         self._rollover_day()
+        want = self._qq_args(str(getattr(event, "message_str", "") or ""))
         fmt = lambda t: datetime.fromtimestamp(t).strftime("%m-%d %H:%M") if t else "-"
         lines = [f"[今晚骰子 v{PLUGIN_VERSION}] 今日 {self._st.get('date')}"
                  f" 心情 {float(self._st.get('mood', 1.0)):.2f}"]
         tmap = self._target_map()
+        matched = False
         for pid, qqs in tmap.items():
             for qq in qqs:
+                if want and str(qq) not in want:
+                    continue
+                matched = True
                 umo = f"{pid}:FriendMessage:{qq}"
                 s = self._sess(umo)
                 pl = s.get("promise") or {}
@@ -4041,6 +4062,9 @@ class DafeiyuDmPlugin(Star):
                 tr_line = (f" 留痕「{tr.get('word')}」{'已提' if tr.get('said') else '待提'}"
                            if tr.get("word") else "")
                 lines.append(f"· {qq}：{p_line}｜{d_line}{pd_line}{tr_line}")
+        if want and not matched:
+            _all = "/".join("/".join(qqs) for qqs in tmap.values()) or "无"
+            lines.append(f"查无目标 {'/'.join(sorted(want))}（现有目标：{_all}）")
         yield event.plain_result("\n".join(lines))
 
     def _miss_day_stats(self, qq: str) -> dict:
