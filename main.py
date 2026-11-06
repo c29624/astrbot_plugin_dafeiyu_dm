@@ -37,7 +37,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.7.5"
+PLUGIN_VERSION = "2.7.6"
 DM_PERSONA_SLICE = 999999  # v2.2.0 切片2600→v2.5.12 放开全量（用户拍板）：主动消息看完整人设，底线下沉段/语气参考不再窗外；主动消息日均≤7条，全量约+1.3K token/条，忽略不计
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -1110,6 +1110,13 @@ class DafeiyuDmPlugin(Star):
         seen = self._st.get("seen") or {}
         cut7 = time.time() - 7 * 86400
         self._st["seen"] = {q: t for q, t in seen.items() if float(t) >= cut7}
+        # v2.7.6 缺席留痕例行清理：已提过嘴的（said）留 48h 过期；一直没提的留 72h
+        #（她始终没开口提就算了，不再喂感官包）——此前 said 痕会永久躺在状态里
+        mt = self._st.get("miss_trace") or {}
+        for u in list(mt.keys()):
+            _age = time.time() - float(mt[u].get("ts") or 0)
+            if (mt[u].get("said") and _age > 48 * 3600) or (not mt[u].get("said") and _age > 72 * 3600):
+                del mt[u]
         # 每日微扰（±20%，当日固定）：阈值三档 + base_p
         if self.c_drift:
             def _dr(x, lo, hi):
@@ -2215,11 +2222,15 @@ class DafeiyuDmPlugin(Star):
             n["p"] = round(p, 3)
             n["win"] = chatted or anchor or (random.random() < p)
             self._dlog({"t": "night_roll", "p": round(p, 3), "chatted": chatted, "said_bye": said_bye,
-                        "owl_f": owl_f, "anchor": anchor, "win": n["win"]})
+                        "owl_f": owl_f, "anchor": anchor, "win": n["win"],
+                        "umo": umo.split(":")[-1]})  # v2.7.6 带目标：多目标时晚安归谁可审计
         if n.get("win"):
             tpl = self.tpl_night2 if already else self.tpl_night
             force_at_bed = bed_ts - now <= 60 * 60  # 到睡觉线1小时内：强制发（活跃终检/查重豁免）
-            sent = await self._send_greet("night", umo, tpl, now, force=force_at_bed)
+            # v2.7.6 必收尾（聊过/你先道别/连跳锚）一并豁免否决——作息事件不交"该不该打扰"的
+            # 判断：她马上要沉默八小时，收尾句严格优于无声消失；概率掷中的晚安照旧可拦
+            sent = await self._send_greet("night", umo, tpl, now, force=force_at_bed,
+                                          no_veto=bool(chatted or anchor))
             if sent or n["tries"] >= 6:
                 n["sent"] = True
                 if sent:
@@ -2230,8 +2241,11 @@ class DafeiyuDmPlugin(Star):
         else:
             n["sent"] = True
 
-    async def _send_greet(self, kind: str, umo: str, template: str, now: float, force: bool = False) -> bool:
-        """早晚安发送：活跃终检（force=到睡觉线豁免）→ 近距查重 → 否决/生成 → 拟人发送+记账"""
+    async def _send_greet(self, kind: str, umo: str, template: str, now: float, force: bool = False,
+                          no_veto: bool = False) -> bool:
+        """早晚安发送：活跃终检（force=到睡觉线豁免）→ 近距查重 → 否决/生成 → 拟人发送+记账
+        no_veto=必发语义线（睡前必收尾/锚点必发）：豁免否决层——v2.7.6 修"必收尾被 AI 否决
+        后销账=整晚零收尾"（他先道了晚安她却无声睡去）"""
         s = self._sess(umo)
         if not self._send_open(umo, now):
             return False  # D7 发送熔断中：本轮不发（不销账，退避结束后窗口再看）
@@ -2240,11 +2254,11 @@ class DafeiyuDmPlugin(Star):
                 return False  # 你正在聊：顺延
             if self.c_greet_gap and now - float(self._st.get("last_dm_ts") or 0) < self.c_greet_gap * 60:
                 return False  # 刚发过别的主动：近距查重
-        text = await self._gen(template, umo=umo, kind=kind, veto_ok=self.c_ai_veto,
+        text = await self._gen(template, umo=umo, kind=kind, veto_ok=self.c_ai_veto and not no_veto,
                                veto_ctx=self._status_ctx(umo) + self._stance_line(umo))
         if text is None:
-            self._dlog({"t": f"{kind}_veto", "why": "AI否决"})
-            return True  # 否决=今日销账（豁免线走不到这，这里只是概率分支被拦）
+            self._dlog({"t": f"{kind}_veto", "why": "AI否决", "umo": umo.split(":")[-1]})
+            return True  # 否决=今日销账（仅概率分支会到这——no_veto 线生成失败回落语料池不会None）
         try:
             await self._send_human(umo, text)
         except Exception:
@@ -2253,7 +2267,7 @@ class DafeiyuDmPlugin(Star):
         archive_text = text + (f"\n[本轮工具：{'；'.join(self._tool_trace[:3])}]" if self._tool_trace else "")
         await self._archive_dm(umo, archive_text)
         self._bookkeep(umo, now, kind)
-        self._dlog({"t": f"{kind}_sent", "text": text[:30]})
+        self._dlog({"t": f"{kind}_sent", "text": text[:30], "umo": umo.split(":")[-1]})
         return True
 
     def _bookkeep(self, umo: str, now: float, kind: str):
