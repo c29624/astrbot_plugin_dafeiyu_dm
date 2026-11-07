@@ -37,7 +37,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.7.6"
+PLUGIN_VERSION = "2.7.7"
 DM_PERSONA_SLICE = 999999  # v2.2.0 切片2600→v2.5.12 放开全量（用户拍板）：主动消息看完整人设，底线下沉段/语气参考不再窗外；主动消息日均≤7条，全量约+1.3K token/条，忽略不计
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
@@ -3581,9 +3581,12 @@ class DafeiyuDmPlugin(Star):
 
     async def _user_spoke_after(self, umo: str, ts: float) -> bool:
         """该会话用户在她醒来(ts)之后是否已发过消息——用于晨起问候防重复
-        （用户先开口=晨间冲刷已发生，她已在对话里报过到）。"""
-        spoke = await self._last_user_ts(umo)
-        return bool(spoke) and spoke > ts
+        （用户先开口=晨间冲刷已发生，她已在对话里报过到）。
+        v2.7.7：改用自己记的 msg_times 流水（per-umo、26h 落盘，不怕日切/重启）——
+        原实现去对话历史消息文本里解析内嵌时间戳，那是群聊存档格式、私聊历史没有，
+        检查从未生效过（11-07 实测：他 09:32 先开口，09:40 她又补"醒啦"重复报到）"""
+        s = self._sess(umo)
+        return any(t > float(ts) for t in (s.get("msg_times") or []))
 
     async def _last_user_ts(self, umo: str) -> float:
         """对方（user侧）最后一条消息的时间，0=解析不到。
