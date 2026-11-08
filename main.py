@@ -2225,6 +2225,23 @@ class DafeiyuDmPlugin(Star):
                         "owl_f": owl_f, "anchor": anchor, "win": n["win"],
                         "umo": umo.split(":")[-1]})  # v2.7.6 带目标：多目标时晚安归谁可审计
         if n.get("win"):
+            # v2.7.8 顺位给睡眠：sleep 陪聊宽限正陪着这个会话→收尾归 sleep 的困意/嘟囔线，
+            # dm 今晚销账不插话（她真走那刻的收尾比排程点的晚安真，也不再"先道晚安又聊半小时"）
+            grace = (self._sleep_state() or {}).get("grace")
+            if isinstance(grace, dict) and str(grace.get("last_umo") or "") == umo:
+                n["sent"] = True
+                self._st.setdefault("evening_skip", {})[qq] = 0
+                self._dlog({"t": "night_yield", "why": "sleep宽限接管收尾",
+                            "umo": umo.split(":")[-1]})
+                return
+            # v2.7.8 已互道晚安：她最近在对话里道过 且 他60分钟内也道过别——收尾已在
+            # 对话里完成，销账不发（再发=又一句晚安）；陈年晚安不算，仍走报备款收尾
+            if already and gn and 0 < now - gn <= 60 * 60:
+                n["sent"] = True
+                self._st.setdefault("evening_skip", {})[qq] = 0
+                self._dlog({"t": "night_skip", "why": "已互道晚安(60min内)",
+                            "umo": umo.split(":")[-1]})
+                return
             tpl = self.tpl_night2 if already else self.tpl_night
             force_at_bed = bed_ts - now <= 60 * 60  # 到睡觉线1小时内：强制发（活跃终检/查重豁免）
             # v2.7.6 必收尾（聊过/你先道别/连跳锚）一并豁免否决——作息事件不交"该不该打扰"的
@@ -2249,11 +2266,12 @@ class DafeiyuDmPlugin(Star):
         s = self._sess(umo)
         if not self._send_open(umo, now):
             return False  # D7 发送熔断中：本轮不发（不销账，退避结束后窗口再看）
-        if not force:
-            if self.c_active_check and now - float(s.get("act_ts") or 0) < self.c_active_check * 60:
-                return False  # 你正在聊：顺延
-            if self.c_greet_gap and now - float(self._st.get("last_dm_ts") or 0) < self.c_greet_gap * 60:
-                return False  # 刚发过别的主动：近距查重
+        # v2.7.8 活跃终检不再被强制窗豁免：热聊中硬插晚安=插话（11-08 00:16事故）。
+        # 强制窗改只豁免近距查重——必达性由窗口循环重试保证（你安静后自然发出）
+        if self.c_active_check and now - float(s.get("act_ts") or 0) < self.c_active_check * 60:
+            return False  # 你正在聊：顺延（含强制窗）
+        if not force and self.c_greet_gap and now - float(self._st.get("last_dm_ts") or 0) < self.c_greet_gap * 60:
+            return False  # 刚发过别的主动：近距查重（强制窗豁免——睡前收尾优先）
         text = await self._gen(template, umo=umo, kind=kind, veto_ok=self.c_ai_veto and not no_veto,
                                veto_ctx=self._status_ctx(umo) + self._stance_line(umo))
         if text is None:
