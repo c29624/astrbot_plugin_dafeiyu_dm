@@ -1947,7 +1947,7 @@ class DafeiyuDmPlugin(Star):
         if self.c_night:
             bed_ts = self._tonight_bed_ts(sl, now)
             if bed_ts:
-                key = datetime.fromtimestamp(bed_ts).date().isoformat()
+                key = self._night_plan_key(bed_ts)
                 nplans = self._st.get("night") or {}
                 new_plan = False
                 for umo in self._target_umos():
@@ -2038,6 +2038,13 @@ class DafeiyuDmPlugin(Star):
                 s["promise_log"] = _lg[-10:]
                 s["promise"] = None
         self._save_state()
+
+    @staticmethod
+    def _night_plan_key(bed_ts: float) -> str:
+        """晚安计划键=所属夜晚的傍晚日（入睡点−6h 的日期）。v2.7.9 修跨零点撞键：
+        date(bed_ts) 会让"00:05 睡的一晚"和"次日 23:36 睡的一晚"同键（都落在同一天），
+        第二晚继承已销账计划→整晚晚安链连掷都不掷（11-10 两目标实测中招）"""
+        return datetime.fromtimestamp(bed_ts - 6 * 3600).date().isoformat()
 
     def _night_bed_from_state(self, st: dict, now: float) -> float:
         """从睡觉插件状态取"当前这一夜的入睡点"。night.bed_ts 落在[现在-16h, 现在+18h]
@@ -3119,10 +3126,21 @@ class DafeiyuDmPlugin(Star):
                 ok, why = self._pending_gates(umo, now, phase)
                 if ok:
                     await self._fire_miss(umo, now)
-                else:
-                    self._dlog({"t": "miss_void", "why": why, "umo": qq})
-                    s["pending"] = None
-                    self._dice_done(umo)  # 作废即终结，不再重想
+                    continue
+                # v2.7.9 中签不白中：评估窗关门/她睡着只是"此刻不能发"，念头没消失——
+                # 顺延重看（11-10 实测 23:07 中签差 1 分钟过窗直接作废，全天零主动）
+                defer_at = self._pending_defer_at(why, pend, now)
+                if defer_at is not None:
+                    pend["at"] = defer_at
+                    pend["defers"] = int(pend.get("defers") or 0) + 1
+                    s["pending"] = pend
+                    self._dlog({"t": "miss_defer", "why": why,
+                                "at": datetime.fromtimestamp(defer_at).strftime("%m-%d %H:%M"),
+                                "umo": qq})
+                    continue
+                self._dlog({"t": "miss_void", "why": why, "umo": qq})
+                s["pending"] = None
+                self._dice_done(umo)  # 作废即终结，不再重想
                 continue
             if pend:
                 continue  # 还没到抖动时刻
@@ -3232,6 +3250,22 @@ class DafeiyuDmPlugin(Star):
                 self._dlog({"t": "miss_lose", "umo": qq, "tier": tier, "p": round(p, 3),
                             "rounds": rounds, "n": attempt})
         self._save_state()
+
+    def _pending_defer_at(self, why: str, pend: dict, now: float):
+        """v2.7.9 中签不白中："过评估时段/睡着了"只是此刻不能发，不是念头消失——
+        顺延重看：首跳次日08:30（评估窗硬边界08:00后），其后每30分钟重看直到
+        开窗/翻篇/其他拦因；20次封顶（约10小时）仍发不出才真作废。
+        其余拦因（翻篇/抑制/熔断/上限/频控）照旧即作废，返回 None"""
+        if why not in ("过评估时段", "睡着了"):
+            return None
+        if int(pend.get("defers") or 0) >= 20:
+            return None
+        if not pend.get("defers"):
+            nxt = datetime.fromtimestamp(now).replace(hour=8, minute=30, second=0, microsecond=0)
+            if nxt.timestamp() <= now:
+                nxt += timedelta(days=1)
+            return nxt.timestamp()
+        return now + 30 * 60
 
     def _pending_gates(self, umo: str, now: float, phase: str):
         """中签到点的终检。返回 (通过, 未过原因)"""
