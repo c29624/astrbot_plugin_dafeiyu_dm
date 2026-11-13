@@ -37,8 +37,14 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.7.7"
+PLUGIN_VERSION = "2.7.12"
 DM_PERSONA_SLICE = 999999  # v2.2.0 切片2600→v2.5.12 放开全量（用户拍板）：主动消息看完整人设，底线下沉段/语气参考不再窗外；主动消息日均≤7条，全量约+1.3K token/条，忽略不计
+
+# v2.7.12 晨间失忆三件套（11-13 事故定案：种子被80字截断+"对方"错标+截断ctx当召回查询词）
+DM_SEED_MARK = "[系统标记：你睡醒后对昨天的记忆——自然记得的梗概，不是TA刚发的消息]"
+DM_RECALL_RECENT_KINDS = {"morning", "night", "makeup"}  # 早晚安/补发：召回只收最近72h内（night2复用night；用户拍板）
+DM_RECALL_RECENT_SEC = 72 * 3600
+DM_RECALL_POOL_K = 12  # 门控场景扩候选：search先按k截断+混近期保送槽，拿top-3再滤会把72h内合规条目漏在候选外=假空（kimi终审）
 SLEEP_STATE_CANDIDATES = [
     Path("data/plugin_data/astrbot_plugin_dafeiyu_sleep/sleep_state.json"),
 ]
@@ -2952,8 +2958,7 @@ class DafeiyuDmPlugin(Star):
         summary = await self._gen_seed(umo, history)
         if not summary:
             return False, False  # 种子失败：不切（调用方安排重试）
-        seed_msg = {"role": "user", "content":
-                    "[系统标记：你睡醒后对昨天的记忆——自然记得的梗概，不是TA刚发的消息]\n" + summary}
+        seed_msg = {"role": "user", "content": DM_SEED_MARK + "\n" + summary}
         await cm.new_conversation(
             umo, content=[seed_msg],
             persona_id=getattr(conv, "persona_id", None))
@@ -3722,6 +3727,13 @@ class DafeiyuDmPlugin(Star):
                 t = self._record_text(rec.get("content", ""))
                 if not t:
                     continue
+                if t.startswith(DM_SEED_MARK):
+                    # v2.7.12 修C：日切种子不砍80字、不标"对方"，整条投影成"你记得的近期相处"。
+                    # 作为一条记录参与窗口滚动：早上顶位、白天聊满自然滚出（用户验收标准）
+                    lines.append(
+                        "[你记得的近期相处（含昨天及此前延续事项；不是TA刚发的消息）]\n" + t)
+                    logger.info(f"[主动私聊] 种子全文进小抄 {len(t)} 字")
+                    continue
                 who = "你" if rec.get("role") == "assistant" else "对方"
                 lines.append(f"{who}: {t[:80]}")
             if not lines:
@@ -3729,6 +3741,8 @@ class DafeiyuDmPlugin(Star):
             lines = lines[-self.c_ctx_n:]
             return "[你们最近的聊天记录（末尾几条，供接话茬）]\n" + "\n".join(lines) + "\n\n"
         except Exception:
+            # v2.7.12：静默空串=无声失忆（11-13 病根的放大器），至少留条日志可查
+            logger.warning("[主动私聊] 最近聊天记录读取异常，本轮小抄为空", exc_info=True)
             return ""
 
     # ---------- 工具调用（v1.3.0）：合成事件 + tool_loop_agent + 白名单过滤 ----------
@@ -3855,14 +3869,19 @@ class DafeiyuDmPlugin(Star):
             pass
         return ""
 
-    async def _memory_recall(self, umo: str, ctx: str) -> str:
+    async def _memory_recall(self, umo: str, ctx: str, kind: str = "") -> str:
         """v2.2.0：主动消息前预取长期记忆（livingmemory）。按目标会话显式隔离检索
-        （各号各翻各的账本），拿最近聊天尾部当查询词；没装/查空/超时一律空串，零影响。"""
+        （各号各翻各的账本），拿最近聊天尾部当查询词；没装/查空/超时一律空串，零影响。
+        v2.7.12：①每条带[来源日期]前缀+块头规则（旧背景，不得当今天/昨晚的事，与
+        近期相处/当前聊天冲突以后者为准）；②早晚安/补发（DM_RECALL_RECENT_KINDS）
+        只收最近72h内记忆——先扩候选再滤（search先按k截断+混近期保送槽，拿top-3再滤
+        会把72h内合规条目漏在候选外出现"假空"），滤完为空整块不注入；想念/留言不限。"""
         if not (self.c_memory_on and umo):
             return ""
         query = ctx.strip()[-200:]
         if len(query) < 10:
             return ""
+        gated = kind in DM_RECALL_RECENT_KINDS
         try:
             meta = self.context.get_registered_star("astrbot_plugin_livingmemory")
             inst = getattr(meta, "star_cls", None) if meta is not None else None
@@ -3871,18 +3890,73 @@ class DafeiyuDmPlugin(Star):
             if not callable(search):
                 return ""
             results = await asyncio.wait_for(
-                search(query, k=self.c_memory_k, session_id=umo), timeout=8)
+                search(query, k=DM_RECALL_POOL_K if gated else self.c_memory_k,
+                       session_id=umo), timeout=8)
+            if gated:
+                results = [r for r in results or []
+                           if self._recall_recent_ok(r)][:self.c_memory_k]
             lines = []
             for r in results or []:
                 t = str(getattr(r, "content", "") or "").strip().replace("\n", " ")
-                if t:
-                    lines.append("- " + t[:120])
+                if not t:
+                    continue
+                d = self._recall_date_prefix(r)
+                lines.append(f"- {d}{t[:120]}" if d else f"- {t[:120]}")
             if not lines:
                 return ""
-            return ("[你刚翻了下自己的旧记忆，这几条与现在最相关（参考用，别原文复述）]\n"
+            return ("[你刚翻了下自己的旧记忆，这几条与现在最相关（参考用，别原文复述；"
+                    "它们是不同时间的旧背景，别当作今天或昨晚刚发生的事，"
+                    "和你记得的近期相处或当前聊天冲突时，以后者为准）]\n"
                     + "\n".join(lines) + "\n\n")
         except Exception:
             return ""
+
+    @staticmethod
+    def _recall_meta(r) -> dict:
+        m = getattr(r, "metadata", None)
+        return m if isinstance(m, dict) else {}
+
+    def _recall_recent_ok(self, r) -> bool:
+        """72h门控判定：来源时间（source_time_start/end，ISO带时区）缺失时退
+        create_time（epoch，记忆写入时间≈捕获时间）；都没有=无法证明近期，按不过"""
+        m = self._recall_meta(r)
+        for key in ("source_time_start", "source_time_end"):
+            v = m.get(key)
+            if isinstance(v, str) and v:
+                try:
+                    dt = datetime.fromisoformat(v)
+                    return (datetime.now().astimezone() - dt).total_seconds() <= DM_RECALL_RECENT_SEC
+                except Exception:
+                    continue
+        v = m.get("create_time")
+        if isinstance(v, (int, float)) and v > 0:
+            return time.time() - float(v) <= DM_RECALL_RECENT_SEC
+        return False
+
+    def _recall_date_prefix(self, r) -> str:
+        """[来源日期:…;旧背景]（事件时间：source_time_label 优先，ISO解析次之）；
+        拿不到才退[记忆整理于:…;旧背景]（create_time=写入时间，不冒充事件时间）"""
+        m = self._recall_meta(r)
+        label = str(m.get("source_time_label") or "").strip()
+        if not label:
+            for key in ("source_time_start", "source_time_end"):
+                v = m.get(key)
+                if isinstance(v, str) and v:
+                    try:
+                        label = datetime.fromisoformat(v).strftime("%Y-%m-%d")
+                        break
+                    except Exception:
+                        continue
+        if label:
+            return f"[来源日期:{label};旧背景] "
+        v = m.get("create_time")
+        if isinstance(v, (int, float)) and v > 0:
+            try:
+                return (f"[记忆整理于:"
+                        f"{datetime.fromtimestamp(float(v)).strftime('%Y-%m-%d')};旧背景] ")
+            except Exception:
+                return ""
+        return ""
 
     def _synthetic_event(self, umo: str):
         """构造合成事件（参照框架 CronMessageEvent 的做法）：
@@ -4010,7 +4084,7 @@ class DafeiyuDmPlugin(Star):
                 ctx = await self._recent_history(umo) if umo else ""
                 if veto_ctx:
                     ctx = veto_ctx + ctx  # 状态事实块放在聊天记录前
-                mem_line = await self._memory_recall(umo, ctx)  # v2.2.0：预取长期记忆（隔离按目标会话）
+                mem_line = await self._memory_recall(umo, ctx, kind)  # v2.2.0 预取长期记忆（隔离按目标会话）；v2.7.12 传 kind 进 72h 门控
                 if mem_line:
                     ctx = mem_line + ctx
                 now_line = f"[当前时间 {datetime.now().strftime('%H:%M')}]\n\n"
