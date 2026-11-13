@@ -37,7 +37,7 @@ except ImportError:
     SessionLLMManager = None
 
 PLUGIN_NAME = "astrbot_plugin_dafeiyu_dm"
-PLUGIN_VERSION = "2.7.12"
+PLUGIN_VERSION = "2.7.13"
 DM_PERSONA_SLICE = 999999  # v2.2.0 切片2600→v2.5.12 放开全量（用户拍板）：主动消息看完整人设，底线下沉段/语气参考不再窗外；主动消息日均≤7条，全量约+1.3K token/条，忽略不计
 
 # v2.7.12 晨间失忆三件套（11-13 事故定案：种子被80字截断+"对方"错标+截断ctx当召回查询词）
@@ -108,6 +108,25 @@ SULK_THR_BASE_H, SULK_THR_SPAN_H = 3.0, 2.0        # 小委屈阈值中心=3h−
 SULK_THR_CLAMP = (40 / 60, 4.0)                    # 钳 40min~4h
 SULK_NIGHT_ADD_H = 8.0                             # 夜间 22~09 发出的 +8h（睡着不算晾）
 SULK_VALID_H = 48.0                                # 小委屈状态有效期
+# v2.7.13 智能重逢（违和度版）——文献底：chronemic expectancy（节奏预期是关系内习得的）、
+# 归因理论（无交代的沉默伤害更大）、抗议行为形态与强度随依恋风格（四挡的原型）
+REUNION_FLOOR_H = 12.0        # 硬地板：短于此不评估
+REUNION_COOLDOWN_H = 24.0     # 两次吃醋最小间隔
+REUNION_BACKSTOP_H = 48.0     # 老保险：超此必触发（平淡挡豁免——回避型的闹法就是不闹）
+REUNION_BACKSTOP_D = 0.65     # 老保险抬到的违和度
+REUNION_GAP_LO_K, REUNION_GAP_HI_K = 1.25, 2.0   # 偏离带 = 他的长间隔中位数的倍数（下限钳12h/24h）
+REUNION_GAP_DEFAULT_H = 15.0  # 节奏冷启动默认（visit_gaps 样本<5 时）
+REUNION_BID_MIN_AGE_H = 6.0   # 主动消息挂起多久才算"晾着"
+REUNION_BID_CAP = 2           # 晾账封顶条数
+REUNION_W = (0.30, 0.30, 0.30, 0.10)   # s_gap / s_bid / s_attr / s_ctx 权重
+REUNION_ANNOUNCE_WORDS = ("上班", "加班", "开会", "出差", "考试", "值班", "要忙", "忙去",
+                           "赶稿", "赶完", "外派", "培训", "上课")
+REUNION_PRESET = {   # 挡位表：触发门槛 / 烈度上限 / 心法（只给分寸不给台词，演法归人设）
+    "平淡": {"dmin": 0.75, "ceil": 0.5, "hint": "心里有数但性子淡，最多一句话点到，不追问不纠缠"},
+    "正常": {"dmin": 0.55, "ceil": 0.8, "hint": "有点在意，哼一声提一嘴就好，TA好好说就不计较"},
+    "热情": {"dmin": 0.40, "ceil": 1.0, "hint": "委屈明明白白，话说得直，想要TA哄一哄"},
+    "病娇": {"dmin": 0.25, "ceil": 1.2, "hint": "压不住，连旧账一起翻，要TA交代清楚去哪了"},
+}
 DRIFT_STEP = 0.20       # 每日参数微扰幅度 ±20%
 
 DEFAULTS = {
@@ -268,6 +287,9 @@ DEFAULTS = {
         "就一两句，别提系统。"
     ),
     "dm_reunion_on": True,            # 重逢委屈（生成侧事实注入）
+    "dm_reunion_mode": "smart",       # v2.713 smart=违和度版 legacy=老48h规则（一键回退）
+    "dm_reunion_dmin": 0.55,          # 重逢触发门槛（仅自定义挡生效；四固定挡由挡位接管）
+    "dm_reunion_ceil": 0.8,           # 重逢烈度上限（仅自定义挡生效）
     "dm_sulk_on": True,               # 被晾小委屈（生成侧事实注入）
     "dm_preset_apply": "",            # v2.4.0 用途预设：companion/balanced/tool，应用后自动清空
     "miss_quiet_mode": "auto",        # auto=跟睡眠作息 / manual=用手动时段
@@ -678,6 +700,9 @@ class DafeiyuDmPlugin(Star):
         self.c_bye_words = [str(x).strip() for x in (g("miss_afk_bye_words") or []) if str(x).strip()]
         self.tpl_afk_check = str(g("dm_afk_check_template") or DEFAULTS["dm_afk_check_template"])
         self.c_reunion_on = bool(g("dm_reunion_on"))
+        self.c_reunion_mode = str(g("dm_reunion_mode") or "smart")
+        self.c_reunion_dmin = min(1.0, max(0.05, float(g("dm_reunion_dmin") or 0.55)))
+        self.c_reunion_ceil = min(1.2, max(0.1, float(g("dm_reunion_ceil") or 0.8)))
         self.c_sulk_on = bool(g("dm_sulk_on"))
         self.c_quiet_mode = str(g("miss_quiet_mode") or "auto").strip().lower()
         if self.c_quiet_mode not in ("auto", "manual"):
@@ -1246,8 +1271,13 @@ class DafeiyuDmPlugin(Star):
             blocks = []
             s = self._sess(umo)
             if s.get("_reunion_due"):
-                blocks.append(self._reunion_block(umo, now))
+                _rb = self._reunion_block(umo, now)
                 s["_reunion_due"] = False
+                if _rb:
+                    blocks.append(_rb)
+                    # v2.7.13 重逢块已含晾账：小委屈同轮让位，不叠加两份委屈
+                    s["sulk"] = None
+                    s["sulk_due"] = None
             if s.get("sulk_due") and now >= float(s.get("sulk_due") or 0):
                 s["sulk_due"] = None
                 if s.get("sulk"):
@@ -1313,13 +1343,10 @@ class DafeiyuDmPlugin(Star):
             s["act_ts"] = now
             s["act_from"] = "user"
             prev_msgs = s.get("msg_times") or []
-            # v2.3.0 重逢检测：隔很久再开口 → 置一次性标志，回复时注入委屈事实
-            if self.c_reunion_on and prev_msgs and (now - float(prev_msgs[-1])) > 48 * 3600:
-                tw = self._t_warm_get(umo)
-                if tw.get("t") is not None:
-                    s["t_warm_before"] = tw
-                s["_reunion_due"] = True
-                s["_reunion_gap"] = now - float(prev_msgs[-1])
+            # v2.7.13 智能重逢：违和度评估（smart=偏离节奏×晾账×归因歧义×昨晚气氛；legacy=老48h）
+            if self.c_reunion_on and prev_msgs:
+                self._reunion_eval(umo, s, now, float(prev_msgs[-1]))
+            s["pends"] = []   # 他来了，晾账清零（评估已读过；开关关也清，防陈账）
             # v2.7.3 赴约状态机（设计稿第七轮定稿，替代 2.7.2 的三档版）：
             # ①完成词（通用回归词任意时候/活动完成词严格匹配活动根）→当场赴约；
             # ②假约：dur 类说词后初始链拖超 8 分钟→作废清零无痕（时刻词不适用——
@@ -1386,6 +1413,13 @@ class DafeiyuDmPlugin(Star):
                 tr["said"] = True
                 self._dlog({"t": "trace_cancel", "umo": umo.split(":")[-1]})
             s["msg_times"] = prev_msgs + [now]
+            # v2.7.13 节奏样本：>6h 的间隔（过夜/整天级）攒着，供重逢偏离度算他的中位节奏
+            _vg = now - float(prev_msgs[-1]) if prev_msgs else 0.0
+            if _vg > 6 * 3600:
+                vg = [x for x in (s.get("visit_gaps") or []) if isinstance(x, (int, float))]
+                vg.append(round(_vg / 3600, 2))
+                s["visit_gaps"] = vg[-40:]
+            s["last_user_text"] = text[:60]   # v2.7.13 归因用：他走前那句话有没有交代
             cut = now - 26 * 3600
             s["msg_times"] = [t for t in s["msg_times"] if t >= cut]
             # 回复反馈懒结算：挂着待观察 → 按延迟给奖励值，Rescorla-Wagner 更新期待值
@@ -2135,7 +2169,7 @@ class DafeiyuDmPlugin(Star):
         if text is None:
             text = random.choice(self.c_pool)  # 必发：生成失败回落语料池也不许哑
         try:
-            await self._send_human(umo, text)
+            await self._send_human(umo, text, kind="留言回应")
         except Exception:
             logger.warning(f"[主动私聊] 留言回应发送失败 {umo}", exc_info=True)
             return False  # 不销账，下轮 tick 再试（at 顺延）
@@ -2295,7 +2329,7 @@ class DafeiyuDmPlugin(Star):
             self._dlog({"t": f"{kind}_veto", "why": "AI否决", "umo": umo.split(":")[-1]})
             return True  # 否决=今日销账（仅概率分支会到这——no_veto 线生成失败回落语料池不会None）
         try:
-            await self._send_human(umo, text)
+            await self._send_human(umo, text, kind=kind)
         except Exception:
             logger.warning(f"[主动私聊] {kind} 发送失败 {umo}", exc_info=True)
             return False
@@ -2782,7 +2816,99 @@ class DafeiyuDmPlugin(Star):
 
     # ---------- v2.3.0 重逢委屈 / 被晾小委屈（表达层：一次性事实注入，不碰概率） ----------
 
+    def _reunion_eval(self, umo: str, s: dict, now: float, prev_msg_ts: float):
+        """v2.7.13 智能重逢评估（他消息进来时）：违和度 D = 偏离他自己的节奏×晾账×归因歧义×昨晚气氛，
+        达到当前性格挡（miss_temperament 共用）的门槛才置 _reunion_due；legacy 模式走老 48h 规则。
+        烈度 R = ceil×(0.3+0.7×带内位置)，再乘期待值耦合（常被晾→反应上浮，刚被哄好→收敛）"""
+        try:
+            gap_h = (now - prev_msg_ts) / 3600.0
+            if gap_h < REUNION_FLOOR_H:
+                return
+            if self.c_reunion_mode != "smart":
+                if gap_h > 48:   # legacy：老规则原样
+                    tw = self._t_warm_get(umo)
+                    if tw.get("t") is not None:
+                        s["t_warm_before"] = tw
+                    s["_reunion_due"] = True
+                    s["_reunion_gap"] = now - prev_msg_ts
+                return
+            if now - float(s.get("_reunion_last") or 0) < REUNION_COOLDOWN_H * 3600:
+                return
+            tier = self._tier_of(umo)
+            pr = REUNION_PRESET.get(tier)
+            if pr:
+                dmin, ceil_v = float(pr["dmin"]), float(pr["ceil"])
+            else:
+                dmin, ceil_v = self.c_reunion_dmin, self.c_reunion_ceil
+            # s_gap：这次间隔偏离他自己的长间隔中位数多少
+            vg = sorted(float(x) for x in (s.get("visit_gaps") or []) if float(x) > 0)
+            p50 = vg[len(vg) // 2] if len(vg) >= 5 else REUNION_GAP_DEFAULT_H
+            lo = max(12.0, REUNION_GAP_LO_K * p50)
+            hi = max(24.0, REUNION_GAP_HI_K * p50)
+            s_gap = min(1.0, max(0.0, (gap_h - lo) / max(0.5, hi - lo)))
+            # s_bid：挂起≥6h 的主动消息晾账（pends 在 _send_human 成功路径记账）
+            pends = [p for p in (s.get("pends") or [])
+                     if isinstance(p, dict) and now - float(p.get("ts") or 0) >= REUNION_BID_MIN_AGE_H * 3600]
+            s_bid = min(len(pends), REUNION_BID_CAP) / REUNION_BID_CAP
+            # s_attr：他走前那句话（last_user_text 前60字）有没有交代要去忙
+            prev_txt = str(s.get("last_user_text") or "")
+            ann = any(w in prev_txt for w in REUNION_ANNOUNCE_WORDS)
+            s_attr = 0.2 if ann else 1.0
+            # s_ctx：昨晚收尾（v1 粗档：挂着未化的小委屈=1.0，其余 0.3；细分留观察期后）
+            s_ctx = 1.0 if (s.get("sulk") and s.get("sulk_due")) else 0.3
+            D = min(1.0, REUNION_W[0] * s_gap + REUNION_W[1] * s_bid + REUNION_W[2] * s_attr + REUNION_W[3] * s_ctx)
+            if gap_h >= REUNION_BACKSTOP_H and tier != "平淡":
+                D = max(D, REUNION_BACKSTOP_D)   # 老保险
+            self._dlog({"t": "reunion_eval", "umo": umo.split(":")[-1], "tier": tier,
+                        "gap_h": round(gap_h, 1), "p50": round(p50, 1), "d": round(D, 2),
+                        "pass": D >= dmin, "f": [round(x, 2) for x in (s_gap, s_bid, s_attr, s_ctx)],
+                        "n": len(pends), "ann": ann})
+            if D < dmin:
+                return
+            R = ceil_v * (0.3 + 0.7 * (D - dmin) / max(0.05, 1 - dmin))
+            if D >= 0.95:
+                R = max(R, 0.35)   # 极端溢出：平淡挡也冷一句，但冷得平淡
+            V = float((self._t_warm_get(umo) or {}).get("t") or 0.5)
+            R = round(min(1.3, R * (0.8 + 0.4 * (1 - V))), 2)
+            s["_reunion_due"] = True
+            s["_reunion_last"] = now
+            s["_reunion_r"] = {"gap_h": round(gap_h, 1), "p50": round(p50, 1), "d": round(D, 2),
+                               "r": R, "n": len(pends),
+                               "kinds": "、".join(str(p.get("kind") or "主动") for p in pends[:3]),
+                               "ann": ann, "f": [round(x, 2) for x in (s_gap, s_bid, s_attr, s_ctx)]}
+            self._dlog({"t": "reunion_roll", "umo": umo.split(":")[-1], "tier": tier,
+                        "gap_h": round(gap_h, 1), "d": round(D, 2), "r": R, "n": len(pends)})
+        except Exception:
+            logger.warning("[主动私聊] 智能重逢评估异常（跳过，不影响消息）", exc_info=True)
+
     def _reunion_block(self, umo: str, now: float) -> str:
+        """v2.7.13 重逢事实块（smart 版）：只陈述账本+情绪强度+性格分寸+修复台阶，演法归人设；
+        无 _reunion_r（legacy 模式）时回落老版"""
+        try:
+            if not self.c_reunion_on:
+                return ""
+            s = self._sess(umo)
+            r = s.get("_reunion_r")
+            if not r:
+                return self._reunion_block_legacy(umo, now)
+            tier = self._tier_of(umo)
+            pr = REUNION_PRESET.get(tier)
+            hint = pr["hint"] if pr else "按你平时的性子拿捏"
+            lines = [f"距TA上一条消息已 {float(r['gap_h']):.0f} 小时（TA平常隔 {float(r['p50']):.0f} 小时左右就会来）"]
+            if int(r.get("n") or 0) > 0:
+                lines.append(f"这期间你主动找过TA {r['n']} 次（{r.get('kinds') or '主动'}），都没等到回复")
+            lines.append("TA走前打过招呼说要忙" if r.get("ann") else "TA走之前什么都没交代")
+            lines.append(f"你此刻的情绪强度 {float(r['r']) * 100:.0f}%（0=毫不在意，100%=顶格）")
+            lines.append(f"性格分寸：{hint}")
+            lines.append("TA现在回来了，TA此刻的态度你自己看——是暖的或带着解释的，就势收，别揪着不放。别提系统")
+            s["_reunion_r"] = None
+            self._dlog({"t": "reunion", "umo": umo.split(":")[-1], "gap_h": r.get("gap_h"),
+                        "d": r.get("d"), "r": r.get("r"), "tier": tier, "n": r.get("n")})
+            return "[重逢事实（只陈述，怎么演按你的性子）：\n" + "；\n".join(lines) + "]\n"
+        except Exception:
+            return ""
+
+    def _reunion_block_legacy(self, umo: str, now: float) -> str:
         """重逢委屈事实块：他特别久没来突然回来。时机=人类时间常数（7~10天封顶），
         强度随 T_before；无历史 fail-open 返回空"""
         try:
@@ -3418,7 +3544,7 @@ class DafeiyuDmPlugin(Star):
             self._dice_done(umo)  # 否决=今日销账，不再重想
             return  # 否决：不耗每日额度，骰子已记已用
         try:
-            await self._send_human(umo, text)
+            await self._send_human(umo, text, kind="想念")
         except Exception:
             logger.warning(f"[主动私聊] 想你发送失败 {umo}", exc_info=True)
             return
@@ -3495,7 +3621,7 @@ class DafeiyuDmPlugin(Star):
         now = now or time.time()
         return now >= float(self._sess(umo).get("send_break_until") or 0)
 
-    async def _send_human(self, umo: str, text: str) -> None:
+    async def _send_human(self, umo: str, text: str, kind: str = "") -> None:
         """拟人发送：按句切分逐条发；下一条的间隔=按它的长度算的打字时间
         （每字 0.10~0.18 秒随机，下限 0.8s、上限 8s）——长句等得久，像真人输入，也防风控。
         v2.5.0 D7：失败记连败（≥3 指数退避），成功清零"""
@@ -3519,6 +3645,10 @@ class DafeiyuDmPlugin(Star):
         s = self._sess(umo)
         s["send_fail"] = 0
         s["send_break_until"] = 0.0
+        if kind:   # v2.7.13 晾账：她的主动发送记账（他一来消息清零；挂起≥6h 才计入重逢违和度）
+            p = [x for x in (s.get("pends") or []) if isinstance(x, dict)]
+            p.append({"kind": kind, "ts": time.time()})
+            s["pends"] = p[-6:]
 
     async def _fire(self, kind: str, template: str, only_qq: str = None) -> bool:
         """返回是否真的发出去了——调用方据此记账，没发出不销账、窗口内自动重试。
@@ -3577,7 +3707,7 @@ class DafeiyuDmPlugin(Star):
                              + "[本次情景：" + _tag + "（TA说" + _w + "离开，到该回来的点还没冒头）]" + chr(10))
                 text = await self._gen(use_tpl, umo, kind=kind, veto_ctx=_vctx)  # 按目标逐个生成（上下文/工具各不同）
                 try:
-                    await self._send_human(umo, text)
+                    await self._send_human(umo, text, kind=kind)
                     sent_any = True
                     logger.info(f"[主动私聊] {kind} -> {qq}: {text[:40]}")
                     # R7：带工具的轮次把工具轨迹拼进归档——否则后续上下文里

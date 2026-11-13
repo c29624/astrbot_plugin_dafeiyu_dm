@@ -567,6 +567,9 @@
         "type": "bool",
         "default": true
       },
+      "dm_reunion_mode": {"description": "重逢算法", "hint": "smart=新算法：看她自己的节奏偏离+你晾了她几条+你走前有没有交代来决定闹不闹、闹多凶；legacy=老规则：只看隔没隔48小时", "type": "string", "options": ["smart", "legacy"], "default": "smart"},
+      "dm_reunion_dmin": {"description": "重逢触发门槛(自定义挡)", "hint": "0~1。性格挡选平淡/正常/热情/病娇时由挡位接管(0.75/0.55/0.40/0.25)，仅自定义挡生效", "type": "float", "default": 0.55},
+      "dm_reunion_ceil": {"description": "重逢烈度上限(自定义挡)", "hint": "0~1.2。挡位接管(0.5/0.8/1.0/1.2)，仅自定义挡生效", "type": "float", "default": 0.8},
       "dm_sulk_on": {
         "description": "被晾小委屈",
         "hint": "她找过TA、TA几小时没回，再开口时她的回复带点小情绪",
